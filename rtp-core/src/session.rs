@@ -256,6 +256,7 @@ impl RtpSession {
         let socket = self.socket.clone();
         let codec_type = self.config.codec;
         let jitter_size = self.config.jitter_buffer_size;
+        let expected_source = self.config.remote_addr;
 
         tokio::spawn(async move {
             let codec = CodecPipeline::new(codec_type);
@@ -266,7 +267,11 @@ impl RtpSession {
                 tokio::select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((len, _source)) => {
+                            Ok((len, source)) => {
+                                // Filter packets from unexpected sources
+                                if source.ip() != expected_source.ip() {
+                                    continue;
+                                }
                                 match RtpPacket::parse(&buf[..len]) {
                                     Ok(packet) => {
                                         jitter.insert(packet);
@@ -328,6 +333,7 @@ impl RtpSession {
         let socket = self.socket.clone();
         let codec_type = self.config.codec;
         let jitter_size = self.config.jitter_buffer_size;
+        let expected_source = self.config.remote_addr;
 
         tokio::spawn(async move {
             let codec = CodecPipeline::new(codec_type);
@@ -338,7 +344,11 @@ impl RtpSession {
                 tokio::select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((len, _source)) => {
+                            Ok((len, source)) => {
+                                // Filter packets from unexpected sources
+                                if source.ip() != expected_source.ip() {
+                                    continue;
+                                }
                                 match RtpPacket::parse(&buf[..len]) {
                                     Ok(packet) => {
                                         if let Some(pt) = dtmf_payload_type {

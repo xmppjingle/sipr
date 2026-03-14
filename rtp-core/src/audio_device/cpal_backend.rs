@@ -3,6 +3,7 @@
 //! Provides real audio capture and playback through system audio devices.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -199,20 +200,24 @@ impl AudioCapture {
             .build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    // Convert f32 to i16
-                    let i16_data: Vec<i16> = data.iter().map(|&s| (s * 32767.0) as i16).collect();
+                    // Convert f32 to i16 with clamping
+                    let i16_data: Vec<i16> = data
+                        .iter()
+                        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+                        .collect();
                     let resampled = if need_resample {
                         resample_linear(&i16_data, src_rate, dst_rate)
                     } else {
                         i16_data
                     };
 
-                    let mut buf = buffer_clone.lock().unwrap();
-                    buf.extend_from_slice(&resampled);
+                    if let Ok(mut buf) = buffer_clone.lock() {
+                        buf.extend_from_slice(&resampled);
 
-                    while buf.len() >= samples_per_frame {
-                        let frame: Vec<i16> = buf.drain(..samples_per_frame).collect();
-                        let _ = tx.try_send(frame);
+                        while buf.len() >= samples_per_frame {
+                            let frame: Vec<i16> = buf.drain(..samples_per_frame).collect();
+                            let _ = tx.try_send(frame);
+                        }
                     }
                 },
                 |err| {
@@ -276,7 +281,7 @@ impl AudioPlayback {
         let out_channels = device_channels;
 
         let (tx, mut rx) = mpsc::channel::<Vec<i16>>(32);
-        let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let buffer_clone = buffer.clone();
 
         // Spawn a task to receive i16 frames, resample/channel-convert, and buffer as f32
@@ -292,10 +297,14 @@ impl AudioPlayback {
                 } else {
                     resampled
                 };
-                // Convert i16 to f32 [-1.0, 1.0]
-                let float_samples: Vec<f32> = converted.iter().map(|&s| s as f32 / 32768.0).collect();
-                let mut buf = buffer_clone.lock().unwrap();
-                buf.extend_from_slice(&float_samples);
+                // Convert i16 to f32 [-1.0, 1.0] with clamping
+                let float_samples: Vec<f32> = converted
+                    .iter()
+                    .map(|&s| (s as f32 / 32768.0).clamp(-1.0, 1.0))
+                    .collect();
+                if let Ok(mut buf) = buffer_clone.lock() {
+                    buf.extend(float_samples.iter());
+                }
             }
         });
 
@@ -305,9 +314,14 @@ impl AudioPlayback {
             .build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut buf = buffer_for_stream.lock().unwrap();
-                    for sample in data.iter_mut() {
-                        *sample = if buf.is_empty() { 0.0 } else { buf.remove(0) };
+                    if let Ok(mut buf) = buffer_for_stream.lock() {
+                        for sample in data.iter_mut() {
+                            *sample = buf.pop_front().unwrap_or(0.0);
+                        }
+                    } else {
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
+                        }
                     }
                 },
                 |err| {

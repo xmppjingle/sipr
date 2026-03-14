@@ -54,6 +54,7 @@ pub struct StatusCode(pub u16);
 impl StatusCode {
     pub const TRYING: Self = Self(100);
     pub const RINGING: Self = Self(180);
+    pub const SESSION_PROGRESS: Self = Self(183);
     pub const OK: Self = Self(200);
     pub const BAD_REQUEST: Self = Self(400);
     pub const UNAUTHORIZED: Self = Self(401);
@@ -67,6 +68,7 @@ impl StatusCode {
         match self.0 {
             100 => "Trying",
             180 => "Ringing",
+            183 => "Session Progress",
             200 => "OK",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -85,6 +87,10 @@ impl StatusCode {
 
     pub fn is_success(&self) -> bool {
         self.0 >= 200 && self.0 < 300
+    }
+
+    pub fn is_redirect(&self) -> bool {
+        self.0 >= 300 && self.0 < 400
     }
 
     pub fn is_error(&self) -> bool {
@@ -580,9 +586,34 @@ mod tests {
     fn test_status_code() {
         assert!(StatusCode::TRYING.is_provisional());
         assert!(StatusCode::RINGING.is_provisional());
+        assert!(StatusCode::SESSION_PROGRESS.is_provisional());
+        assert!(!StatusCode::SESSION_PROGRESS.is_success());
+        assert!(!StatusCode::SESSION_PROGRESS.is_error());
+        assert_eq!(StatusCode::SESSION_PROGRESS.0, 183);
+        assert_eq!(StatusCode::SESSION_PROGRESS.reason_phrase(), "Session Progress");
         assert!(StatusCode::OK.is_success());
         assert!(StatusCode::UNAUTHORIZED.is_error());
         assert!(StatusCode::NOT_FOUND.is_error());
+    }
+
+    #[test]
+    fn test_parse_183_session_progress() {
+        let raw = "SIP/2.0 183 Session Progress\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK776\r\n\
+                   From: <sip:alice@example.com>;tag=abc123\r\n\
+                   To: <sip:bob@example.com>;tag=xyz789\r\n\
+                   Call-ID: early-media-test@10.0.0.1\r\n\
+                   CSeq: 1 INVITE\r\n\
+                   Content-Type: application/sdp\r\n\
+                   Content-Length: 0\r\n\
+                   \r\n";
+        let msg = SipMessage::parse(raw).expect("should parse 183");
+        assert!(msg.is_response());
+        let status = msg.status().expect("should have status");
+        assert_eq!(status.0, 183);
+        assert!(status.is_provisional());
+        assert!(!status.is_success());
+        assert_eq!(status.reason_phrase(), "Session Progress");
     }
 
     #[test]

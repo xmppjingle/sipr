@@ -90,43 +90,51 @@ impl SipTransport {
     pub fn start_receiving(
         &self,
         buffer_size: usize,
-    ) -> mpsc::Receiver<IncomingMessage> {
+    ) -> (mpsc::Receiver<IncomingMessage>, mpsc::Sender<()>) {
         let (tx, rx) = mpsc::channel(buffer_size);
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let socket = self.socket.clone();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, source)) => {
-                        let data = String::from_utf8_lossy(&buf[..len]);
-                        match SipMessage::parse(&data) {
-                            Ok(message) => {
-                                if tx
-                                    .send(IncomingMessage {
-                                        message,
-                                        source,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break; // Channel closed
+                tokio::select! {
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, source)) => {
+                                let data = String::from_utf8_lossy(&buf[..len]);
+                                match SipMessage::parse(&data) {
+                                    Ok(message) => {
+                                        if tx
+                                            .send(IncomingMessage {
+                                                message,
+                                                source,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break; // Channel closed
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to parse SIP message from {}: {}", source, e);
+                                    }
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to parse SIP message from {}: {}", source, e);
+                                tracing::error!("UDP receive error: {}", e);
+                                break;
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("UDP receive error: {}", e);
+                    _ = stop_rx.recv() => {
                         break;
                     }
                 }
             }
         });
 
-        rx
+        (rx, stop_tx)
     }
 
     /// Get the underlying socket reference (for advanced usage)
@@ -149,10 +157,27 @@ pub fn parse_sip_uri(uri: &str) -> Option<(String, u16)> {
     // Remove any URI parameters
     let host_part = host_part.split(';').next()?;
 
-    // Parse host:port
-    if let Some((host, port_str)) = host_part.rsplit_once(':') {
-        let port: u16 = port_str.parse().ok()?;
+    // Parse host:port (handle IPv6 bracket notation)
+    if host_part.starts_with('[') {
+        // IPv6: [host]:port or [host]
+        let end_bracket = host_part.find(']')?;
+        let host = &host_part[1..end_bracket];
+        let after = &host_part[end_bracket + 1..];
+        let port = if let Some(port_str) = after.strip_prefix(':') {
+            port_str.parse().ok()?
+        } else {
+            5060
+        };
         Some((host.to_string(), port))
+    } else if let Some((host, port_str)) = host_part.rsplit_once(':') {
+        // Avoid splitting on IPv6 colons (unbracketed)
+        if host.contains(':') {
+            // Likely bare IPv6 without brackets
+            Some((host_part.to_string(), 5060))
+        } else {
+            let port: u16 = port_str.parse().ok()?;
+            Some((host.to_string(), port))
+        }
     } else {
         Some((host_part.to_string(), 5060))
     }
@@ -267,7 +292,7 @@ mod tests {
         let t1 = SipTransport::bind("127.0.0.1:0").await.unwrap();
         let t2 = SipTransport::bind("127.0.0.1:0").await.unwrap();
 
-        let mut rx = t2.start_receiving(16);
+        let (mut rx, _stop_tx) = t2.start_receiving(16);
 
         let request = crate::message::RequestBuilder::new(
             crate::message::SipMethod::Options,

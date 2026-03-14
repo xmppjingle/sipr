@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.70%2B-orange.svg" alt="Rust"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg" alt="License: PolyForm Noncommercial 1.0.0"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://github.com/xmppjingle/sipr/actions"><img src="https://github.com/xmppjingle/sipr/actions/workflows/ci.yml/badge.svg" alt="Build Status"></a>
   <a href="#quick-start"><img src="https://img.shields.io/badge/crates.io-unpublished-lightgrey.svg" alt="Crates.io unpublished"></a>
   <a href="#highlights"><img src="https://img.shields.io/badge/release-none%20yet-lightgrey.svg" alt="Release none yet"></a>
@@ -53,6 +53,34 @@ Press **`Ctrl+C`** to hang up.
 git clone https://github.com/xmppjingle/sipr.git
 cd sipr
 cargo install --path siphone
+```
+
+### Homebrew (custom tap)
+
+Install from a Homebrew tap (after a formula is published):
+
+```sh
+brew tap <owner>/sipr
+brew install siphone
+```
+
+### Ubuntu (.deb)
+
+Install from a GitHub Release `.deb`:
+
+```sh
+wget https://github.com/xmppjingle/sipr/releases/download/vX.Y.Z/siphone_X.Y.Z_amd64.deb
+sudo apt install ./siphone_X.Y.Z_amd64.deb
+```
+
+Build your own `.deb` package from source:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y libasound2-dev pkg-config
+cargo install cargo-deb
+cargo deb -p siphone
+sudo apt install ./target/debian/siphone_*_amd64.deb
 ```
 
 ### Requirements
@@ -192,6 +220,59 @@ cargo test --workspace
 RUST_LOG=debug siphone call sip:test@example.com --user test
 ```
 
+## Publish to Homebrew
+
+You can publish via your own tap, and Apache-2.0 is compatible with Homebrew/core licensing requirements.
+
+1. Create a tap repository, for example `github.com/<owner>/homebrew-sipr`.
+2. Add a formula using the helper script:
+
+```sh
+# From the sipr repo:
+./scripts/update-homebrew-formula.sh v0.1.0 ../homebrew-sipr/Formula/siphone.rb
+```
+
+3. Commit and push in the tap repository:
+
+```sh
+cd ../homebrew-sipr
+git add Formula/siphone.rb
+git commit -m "siphone v0.1.0"
+git push
+```
+
+4. Users can then install:
+
+```sh
+brew tap <owner>/sipr
+brew install siphone
+```
+
+### Optional: GitHub Actions publisher
+
+This repo includes `.github/workflows/publish-homebrew.yml` to update a tap formula automatically.
+
+- Add a repository secret named `TAP_GITHUB_TOKEN` with push access to your tap repo.
+- Run the workflow manually with:
+  - `tag`: release tag (for example `v0.1.0`)
+  - `tap_repo`: full tap repo name (for example `xmppjingle/homebrew-sipr`)
+
+## Publish Ubuntu Packages
+
+This repo includes `.github/workflows/release-deb.yml` to build and publish `.deb` packages.
+
+- On every `v*` tag push, it:
+  - builds `siphone` Debian package via `cargo deb`
+  - uploads it as a workflow artifact
+  - attaches it to the GitHub Release for that tag
+
+Release example:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE) — free to use, modify, and share for noncommercial purposes.
+[Apache License 2.0](LICENSE).
