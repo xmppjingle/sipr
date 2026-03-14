@@ -134,6 +134,8 @@ impl SdpSession {
         // Add standard codecs
         media.add_codec(0, "PCMU", 8000, None);
         media.add_codec(8, "PCMA", 8000, None);
+        media.add_codec(101, "telephone-event", 8000, None);
+        media.add_attribute("fmtp", Some("101 0-15"));
         media.add_codec(111, "opus", 48000, Some(2));
         media.add_attribute("sendrecv", None);
         self.media_descriptions.push(media);
@@ -284,6 +286,18 @@ impl SdpSession {
     pub fn get_connection_address(&self) -> Option<&str> {
         self.connection_address.as_deref()
     }
+
+    pub fn get_audio_dtmf_payload_type(&self) -> Option<u8> {
+        let audio = self
+            .media_descriptions
+            .iter()
+            .find(|m| m.media_type == MediaType::Audio)?;
+        audio
+            .rtpmaps
+            .iter()
+            .find(|rtpmap| rtpmap.encoding_name.eq_ignore_ascii_case("telephone-event"))
+            .map(|rtpmap| rtpmap.payload_type)
+    }
 }
 
 fn parse_rtpmap(value: &str) -> Option<RtpMap> {
@@ -373,9 +387,11 @@ mod tests {
         s=sip-rs\r\n\
         c=IN IP4 192.168.1.100\r\n\
         t=0 0\r\n\
-        m=audio 49170 RTP/AVP 0 8 111\r\n\
+        m=audio 49170 RTP/AVP 0 8 101 111\r\n\
         a=rtpmap:0 PCMU/8000\r\n\
         a=rtpmap:8 PCMA/8000\r\n\
+        a=rtpmap:101 telephone-event/8000\r\n\
+        a=fmtp:101 0-15\r\n\
         a=rtpmap:111 opus/48000/2\r\n\
         a=sendrecv\r\n";
 
@@ -392,15 +408,17 @@ mod tests {
         assert_eq!(audio.media_type, MediaType::Audio);
         assert_eq!(audio.port, 49170);
         assert_eq!(audio.protocol, TransportProtocol::RtpAvp);
-        assert_eq!(audio.formats, vec![0, 8, 111]);
-        assert_eq!(audio.rtpmaps.len(), 3);
+        assert_eq!(audio.formats, vec![0, 8, 101, 111]);
+        assert_eq!(audio.rtpmaps.len(), 4);
 
         assert_eq!(audio.rtpmaps[0].encoding_name, "PCMU");
         assert_eq!(audio.rtpmaps[0].clock_rate, 8000);
         assert_eq!(audio.rtpmaps[1].encoding_name, "PCMA");
-        assert_eq!(audio.rtpmaps[2].encoding_name, "opus");
-        assert_eq!(audio.rtpmaps[2].clock_rate, 48000);
-        assert_eq!(audio.rtpmaps[2].channels, Some(2));
+        assert_eq!(audio.rtpmaps[2].encoding_name, "telephone-event");
+        assert_eq!(audio.rtpmaps[2].clock_rate, 8000);
+        assert_eq!(audio.rtpmaps[3].encoding_name, "opus");
+        assert_eq!(audio.rtpmaps[3].clock_rate, 48000);
+        assert_eq!(audio.rtpmaps[3].channels, Some(2));
     }
 
     #[test]
@@ -423,9 +441,11 @@ mod tests {
         let output = sdp.to_string();
         assert!(output.contains("v=0"));
         assert!(output.contains("c=IN IP4 10.0.0.1"));
-        assert!(output.contains("m=audio 5004 RTP/AVP 0 8 111"));
+        assert!(output.contains("m=audio 5004 RTP/AVP 0 8 101 111"));
         assert!(output.contains("a=rtpmap:0 PCMU/8000"));
         assert!(output.contains("a=rtpmap:8 PCMA/8000"));
+        assert!(output.contains("a=rtpmap:101 telephone-event/8000"));
+        assert!(output.contains("a=fmtp:101 0-15"));
         assert!(output.contains("a=rtpmap:111 opus/48000/2"));
         assert!(output.contains("a=sendrecv"));
     }
@@ -441,7 +461,8 @@ mod tests {
         assert_eq!(parsed.version, 0);
         assert_eq!(parsed.connection_address, Some("192.168.1.50".to_string()));
         assert_eq!(parsed.get_audio_port(), Some(8000));
-        assert_eq!(parsed.media_descriptions[0].rtpmaps.len(), 3);
+        assert_eq!(parsed.media_descriptions[0].rtpmaps.len(), 4);
+        assert_eq!(parsed.get_audio_dtmf_payload_type(), Some(101));
     }
 
     #[test]

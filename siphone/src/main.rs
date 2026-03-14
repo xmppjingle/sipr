@@ -56,6 +56,7 @@ enum Commands {
                             Press Ctrl+C to hang up during an active call.\n\n\
                             Examples:\n  \
                               siphone call sip:2234@135.125.159.46 --user 2234\n  \
+                              siphone call sip:bob@example.com\n  \
                               siphone call sip:bob@example.com --server sip.example.com --user alice\n  \
                               siphone call sip:bob@192.168.1.100 --user alice --record call.wav\n  \
                               siphone call sip:bob@example.com --user alice --codec pcma")]
@@ -65,9 +66,9 @@ enum Commands {
         /// SIP server/proxy address (optional, extracted from URI if omitted)
         #[arg(long)]
         server: Option<String>,
-        /// SIP username
+        /// SIP username (optional; auto-derived when omitted)
         #[arg(long)]
-        user: String,
+        user: Option<String>,
         /// Local UDP port for SIP signaling (default: 5060)
         #[arg(long, default_value = "5060")]
         port: u16,
@@ -124,6 +125,25 @@ enum Commands {
         /// Output WAV file path (for capture mode)
         #[arg(long, default_value = "capture.wav")]
         output_file: String,
+    },
+
+    /// Capture mic audio and play it back
+    #[command(long_about = "Record from microphone for a short duration and immediately\n\
+                            play back what was captured through your output device.\n\n\
+                            Examples:\n  \
+                              siphone test-mic\n  \
+                              siphone test-mic --duration 5\n  \
+                              siphone test-mic --input \"USB Mic\" --output default")]
+    TestMic {
+        /// Input device for capture: \"default\", index, or name
+        #[arg(long, default_value = "default")]
+        input: String,
+        /// Output device for playback: \"default\", index, or name
+        #[arg(long, default_value = "default")]
+        output: String,
+        /// Capture duration in seconds
+        #[arg(long, default_value = "3")]
+        duration: u64,
     },
 
     /// Show status of current sessions
@@ -225,12 +245,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
-            phone.call(&uri, server.as_deref(), &user).await?;
+            phone.call(&uri, server.as_deref(), user.as_deref()).await?;
             println!("Calling {}...", uri);
 
             let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
             tokio::select! {
-                result = phone.run_call(recorder.as_mut()) => {
+                result = phone.run_call(recorder.as_mut(), &input_device, &output_device) => {
                     match result {
                         Ok(_) => println!("Call ended"),
                         Err(e) => println!("Call error: {}", e),
@@ -279,6 +299,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_file,
         } => {
             cmd_test_audio(&mode, &input, &output, duration, frequency, &output_file).await?;
+        }
+        Commands::TestMic {
+            input,
+            output,
+            duration,
+        } => {
+            cmd_test_mic(&input, &output, duration).await?;
         }
         Commands::Status => {
             println!("No active sessions");
@@ -507,6 +534,82 @@ async fn cmd_test_audio(
         _ => {
             println!("Unknown test mode '{}'. Use: tone, capture, or loopback", mode);
         }
+    }
+
+    Ok(())
+}
+
+async fn cmd_test_mic(
+    input: &str,
+    output: &str,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !rtp_core::audio_device::is_audio_available() {
+        println!("Cannot run test-mic: no audio devices available.");
+        println!("{}", rtp_core::audio_device::audio_unavailable_reason());
+        return Ok(());
+    }
+
+    #[cfg(feature = "audio-device")]
+    {
+        let audio_config = AudioConfig::telephony();
+        let input_sel = DeviceSelector::from_arg(input);
+        let output_sel = DeviceSelector::from_arg(output);
+
+        println!(
+            "Capturing from {} for {}s, then playing back on {}...",
+            input_sel, duration, output_sel
+        );
+
+        let mut capture = rtp_core::audio_device::AudioCapture::start(&input_sel, &audio_config)
+            .map_err(|e| format!("Capture error: {}", e))?;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(duration);
+        let mut frames: Vec<Vec<i16>> = Vec::new();
+
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(frame)) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                capture.next_frame(),
+            )
+            .await
+            {
+                frames.push(frame);
+            }
+        }
+
+        if frames.is_empty() {
+            println!("No audio captured. Check mic permissions/device selection.");
+            return Ok(());
+        }
+
+        println!(
+            "Captured {} frame(s) (~{:.1}s). Playing back...",
+            frames.len(),
+            (frames.len() as f64 * audio_config.frame_size_ms as f64) / 1000.0
+        );
+
+        let playback = rtp_core::audio_device::AudioPlayback::start(&output_sel, &audio_config)
+            .map_err(|e| format!("Playback error: {}", e))?;
+
+        for frame in frames {
+            playback
+                .play_frame(frame)
+                .await
+                .map_err(|e| format!("Playback error: {}", e))?;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                audio_config.frame_size_ms as u64,
+            ))
+            .await;
+        }
+
+        println!("Mic test playback complete.");
+    }
+
+    #[cfg(not(feature = "audio-device"))]
+    {
+        println!("Audio device support not compiled in.");
+        println!("Rebuild with: cargo build --features audio-device");
     }
 
     Ok(())

@@ -39,8 +39,8 @@
 # Install from source
 cargo install --path siphone
 
-# Make a call — it's that simple
-siphone call sip:echo@sip.provider.com --user alice
+# Make a call — it's that simple (no --server or --user required)
+siphone call sip:echo@sip.provider.com
 ```
 
 Press **`Ctrl+C`** to hang up.
@@ -67,6 +67,12 @@ cargo install --path siphone
 The server is automatically extracted from the SIP URI — no need to specify it separately:
 
 ```sh
+siphone call sip:bob@sip.example.com
+```
+
+Use a custom caller identity if you want:
+
+```sh
 siphone call sip:bob@sip.example.com --user alice
 ```
 
@@ -86,6 +92,19 @@ siphone call sip:echo@provider.com --user alice --record conversation.wav
 
 The recording is saved even if you hang up with `Ctrl+C`.
 
+### Send DTMF During a Call
+
+After the call connects, use interactive commands:
+
+```text
+dtmf 123#      # queue/send RTP RFC2833 DTMF
+dtmf-info 55   # queue/send SIP INFO DTMF
+dtmf-send      # flush queued DTMF immediately
+dtmf-queue     # show queued DTMF count
+```
+
+Incoming DTMF is announced in the CLI for both RTP RFC2833 and SIP INFO.
+
 ### Register with a SIP Server
 
 ```sh
@@ -100,6 +119,9 @@ siphone devices
 
 # Test your speakers with a tone
 siphone test-audio --duration 3
+
+# Test mic capture + playback loop (3s default)
+siphone test-mic
 ```
 
 ## Architecture

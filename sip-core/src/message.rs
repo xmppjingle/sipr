@@ -10,6 +10,7 @@ pub enum SipMethod {
     Bye,
     Cancel,
     Options,
+    Info,
     Other(String),
 }
 
@@ -22,6 +23,7 @@ impl SipMethod {
             "BYE" => SipMethod::Bye,
             "CANCEL" => SipMethod::Cancel,
             "OPTIONS" => SipMethod::Options,
+            "INFO" => SipMethod::Info,
             other => SipMethod::Other(other.to_string()),
         }
     }
@@ -34,6 +36,7 @@ impl SipMethod {
             SipMethod::Bye => "BYE",
             SipMethod::Cancel => "CANCEL",
             SipMethod::Options => "OPTIONS",
+            SipMethod::Info => "INFO",
             SipMethod::Other(s) => s.as_str(),
         }
     }
@@ -566,6 +569,7 @@ mod tests {
         assert_eq!(SipMethod::from_str("invite"), SipMethod::Invite);
         assert_eq!(SipMethod::from_str("BYE"), SipMethod::Bye);
         assert_eq!(SipMethod::from_str("REGISTER"), SipMethod::Register);
+        assert_eq!(SipMethod::from_str("INFO"), SipMethod::Info);
         assert_eq!(
             SipMethod::from_str("SUBSCRIBE"),
             SipMethod::Other("SUBSCRIBE".to_string())

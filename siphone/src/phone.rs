@@ -1,10 +1,12 @@
 use crate::sip_debug::SipDebugger;
-use rtp_core::{AudioRecorder, CodecType, RtpSession, SessionConfig};
+use rtp_core::audio_device::{AudioConfig, DeviceSelector};
+use rtp_core::{AudioRecorder, CodecType, ReceiveEvent, RtpSession, SessionConfig};
 use sip_core::header::{generate_branch, generate_tag, HeaderName};
-use sip_core::message::{RequestBuilder, SipMessage, SipMethod};
+use sip_core::message::{RequestBuilder, ResponseBuilder, SipMessage, SipMethod, StatusCode};
 use sip_core::sdp::SdpSession;
 use sip_core::dialog::SipDialog;
 use sip_core::transport::SipTransport;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -22,6 +24,18 @@ pub enum PhoneError {
     CallFailed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtmfMethod {
+    Rfc2833,
+    SipInfo,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedDtmf {
+    digit: char,
+    method: DtmfMethod,
+}
+
 pub struct SoftPhone {
     transport: SipTransport,
     dialog: Option<SipDialog>,
@@ -31,6 +45,11 @@ pub struct SoftPhone {
     local_ip: String,
     live_recorder: Option<AudioRecorder>,
     pending_record_path: Option<String>,
+    remote_sip_addr: Option<SocketAddr>,
+    remote_dtmf_payload_type: Option<u8>,
+    local_dtmf_payload_type: u8,
+    dtmf_queue: VecDeque<QueuedDtmf>,
+    last_announced_rfc2833: Option<(char, u32)>,
 }
 
 impl SoftPhone {
@@ -49,6 +68,11 @@ impl SoftPhone {
             local_ip,
             live_recorder: None,
             pending_record_path: None,
+            remote_sip_addr: None,
+            remote_dtmf_payload_type: None,
+            local_dtmf_payload_type: 101,
+            dtmf_queue: VecDeque::new(),
+            last_announced_rfc2833: None,
         })
     }
 
@@ -107,13 +131,18 @@ impl SoftPhone {
         &mut self,
         uri: &str,
         server: Option<&str>,
-        user: &str,
+        user: Option<&str>,
     ) -> Result<(), PhoneError> {
         let target_uri = if uri.starts_with("sip:") {
             uri.to_string()
         } else {
             format!("sip:{}", uri)
         };
+        let caller_user = user
+            .map(|u| u.to_string())
+            .or_else(|| extract_user_from_uri(&target_uri))
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "siphone".to_string());
 
         // Extract host from URI if no server given: sip:user@host -> host
         let server_host = if let Some(s) = server {
@@ -138,6 +167,10 @@ impl SoftPhone {
         // Build SDP offer
         let mut sdp = SdpSession::new(&self.local_ip);
         sdp.add_audio_media(rtp_port);
+        self.local_dtmf_payload_type = sdp.get_audio_dtmf_payload_type().unwrap_or(101);
+        self.remote_dtmf_payload_type = None;
+        self.dtmf_queue.clear();
+        self.last_announced_rfc2833 = None;
         let sdp_body = sdp.to_string();
 
         let request = RequestBuilder::new(SipMethod::Invite, &target_uri)
@@ -151,14 +184,14 @@ impl SoftPhone {
             .header(HeaderName::MaxForwards, "70")
             .header(
                 HeaderName::From,
-                format!("<sip:{}@{}>;tag={}", user, server_host, self.local_tag),
+                format!("<sip:{}@{}>;tag={}", caller_user, server_host, self.local_tag),
             )
             .header(HeaderName::To, format!("<{}>", target_uri))
             .header(HeaderName::CallId, &call_id)
             .header(HeaderName::CSeq, "1 INVITE")
             .header(
                 HeaderName::Contact,
-                format!("<sip:{}@{}>", user, local_addr),
+                format!("<sip:{}@{}>", caller_user, local_addr),
             )
             .header(HeaderName::ContentType, "application/sdp")
             .header(HeaderName::UserAgent, "siphone/0.1.0")
@@ -172,7 +205,7 @@ impl SoftPhone {
         let dialog = SipDialog::new_uac(
             call_id.clone(),
             self.local_tag.clone(),
-            format!("sip:{}@{}", user, server_host),
+            format!("sip:{}@{}", caller_user, server_host),
             target_uri,
         );
 
@@ -240,16 +273,32 @@ impl SoftPhone {
         Ok(incoming.message)
     }
 
-    pub async fn run_call(&mut self, mut recorder: Option<&mut AudioRecorder>) -> Result<(), PhoneError> {
+    pub async fn run_call(
+        &mut self,
+        mut recorder: Option<&mut AudioRecorder>,
+        input_device: &str,
+        output_device: &str,
+    ) -> Result<(), PhoneError> {
         let mut rx = self.transport.start_receiving(32);
         let mut rtp_stop_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
-        let mut rtp_audio_rx: Option<tokio::sync::mpsc::Receiver<Vec<i16>>> = None;
+        let mut rtp_event_rx: Option<tokio::sync::mpsc::Receiver<ReceiveEvent>> = None;
+        let mut live_recorder: Option<AudioRecorder> = None;
         let mut rtp_connected = false;
         let mut muted = false;
         let call_start = tokio::time::Instant::now();
         let mut recording_active = recorder.is_some();
+        let mut announced_audio_tx = false;
+        let mut announced_audio_rx = false;
         let mut debugger = SipDebugger::new(false);
         let local_addr = self.transport.local_addr();
+        let audio_config = AudioConfig::telephony();
+        let input_sel = DeviceSelector::from_arg(input_device);
+        let output_sel = DeviceSelector::from_arg(output_device);
+
+        #[cfg(feature = "audio-device")]
+        let mut mic_capture: Option<rtp_core::audio_device::AudioCapture> = None;
+        #[cfg(feature = "audio-device")]
+        let mut speaker_playback: Option<rtp_core::audio_device::AudioPlayback> = None;
 
         // Interactive stdin reader
         let stdin = tokio::io::stdin();
@@ -262,6 +311,31 @@ impl SoftPhone {
         if recorder.is_some() {
             println!("Recording active.");
         }
+        if rtp_core::audio_device::is_audio_available() {
+            #[cfg(feature = "audio-device")]
+            {
+                match rtp_core::audio_device::AudioCapture::start(&input_sel, &audio_config) {
+                    Ok(cap) => {
+                        mic_capture = Some(cap);
+                        println!("Live mic capture enabled: {}", input_sel);
+                    }
+                    Err(e) => {
+                        println!("Mic capture unavailable (using silence TX): {}", e);
+                    }
+                }
+                match rtp_core::audio_device::AudioPlayback::start(&output_sel, &audio_config) {
+                    Ok(pb) => {
+                        speaker_playback = Some(pb);
+                        println!("Live speaker playback enabled: {}", output_sel);
+                    }
+                    Err(e) => {
+                        println!("Speaker playback unavailable: {}", e);
+                    }
+                }
+            }
+        } else {
+            println!("No live audio device available; RTP will run without local playback/capture.");
+        }
         println!("Type 'help' for interactive commands.");
 
         loop {
@@ -270,18 +344,82 @@ impl SoftPhone {
 
                 // Prioritize draining audio to prevent channel backpressure
                 audio = async {
-                    if let Some(ref mut arx) = rtp_audio_rx {
+                    if let Some(ref mut arx) = rtp_event_rx {
                         arx.recv().await
                     } else {
                         std::future::pending().await
                     }
                 } => {
-                    if let Some(frame) = audio {
-                        if recording_active {
-                            if let Some(ref mut rec) = recorder {
-                                rec.record_frame(&frame);
-                                while let Ok(extra) = rtp_audio_rx.as_mut().unwrap().try_recv() {
-                                    rec.record_frame(&extra);
+                    if let Some(event) = audio {
+                        match event {
+                            ReceiveEvent::Audio(frame) => {
+                                if !announced_audio_rx {
+                                    if let Some(ref rtp) = self.rtp_session {
+                                        let s = rtp.stats();
+                                        let codec = s.codec;
+                                        println!(
+                                            "Audio RX active: codec={} PT={} rate={}Hz",
+                                            codec,
+                                            codec.payload_type(),
+                                            codec.clock_rate()
+                                        );
+                                    } else {
+                                        println!("Audio RX active.");
+                                    }
+                                    announced_audio_rx = true;
+                                }
+                                #[cfg(feature = "audio-device")]
+                                if let Some(ref playback) = speaker_playback {
+                                    let _ = playback.play_frame(frame.clone()).await;
+                                }
+                                if recording_active {
+                                    if let Some(rec) = recorder.as_deref_mut() {
+                                        rec.record_frame(&frame);
+                                        while let Ok(extra) = rtp_event_rx.as_mut().unwrap().try_recv() {
+                                            match extra {
+                                                ReceiveEvent::Audio(extra_frame) => {
+                                                    rec.record_frame(&extra_frame);
+                                                }
+                                                ReceiveEvent::Dtmf(dtmf) => {
+                                                    if dtmf.end {
+                                                        let key = (dtmf.digit, dtmf.timestamp);
+                                                        if self.last_announced_rfc2833 != Some(key) {
+                                                            self.last_announced_rfc2833 = Some(key);
+                                                            println!("DTMF received (RTP RFC2833): {}", dtmf.digit);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(rec) = live_recorder.as_mut() {
+                                        rec.record_frame(&frame);
+                                        while let Ok(extra) = rtp_event_rx.as_mut().unwrap().try_recv() {
+                                            match extra {
+                                                ReceiveEvent::Audio(extra_frame) => {
+                                                    rec.record_frame(&extra_frame);
+                                                }
+                                                ReceiveEvent::Dtmf(dtmf) => {
+                                                    if dtmf.end {
+                                                        let key = (dtmf.digit, dtmf.timestamp);
+                                                        if self.last_announced_rfc2833 != Some(key) {
+                                                            self.last_announced_rfc2833 = Some(key);
+                                                            println!("DTMF received (RTP RFC2833): {}", dtmf.digit);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ReceiveEvent::Dtmf(dtmf) => {
+                                // RFC2833 sends repeated packets for one digit. Announce once when event ends.
+                                if dtmf.end {
+                                    let key = (dtmf.digit, dtmf.timestamp);
+                                    if self.last_announced_rfc2833 != Some(key) {
+                                        self.last_announced_rfc2833 = Some(key);
+                                        println!("DTMF received (RTP RFC2833): {}", dtmf.digit);
+                                    }
                                 }
                             }
                         }
@@ -306,6 +444,7 @@ impl SoftPhone {
                                     println!("Call progress: {} {}", status, status.reason_phrase());
                                 } else if status.is_success() {
                                     println!("Call connected!");
+                                    self.remote_sip_addr = Some(incoming.source);
 
                                     // Parse SDP from response to get remote RTP addr
                                     if let Some(body) = msg.body() {
@@ -313,14 +452,21 @@ impl SoftPhone {
                                             let rtp_port = sdp.get_audio_port().unwrap_or(0);
                                             let rtp_host = sdp.get_connection_address()
                                                 .unwrap_or("0.0.0.0");
+                                            self.remote_dtmf_payload_type = sdp.get_audio_dtmf_payload_type();
+                                            if let Some(pt) = self.remote_dtmf_payload_type {
+                                                println!("Remote DTMF RTP payload type: {}", pt);
+                                            }
                                             if let Ok(addr) = format!("{}:{}", rtp_host, rtp_port)
                                                 .parse::<SocketAddr>()
                                             {
                                                 if let Some(ref mut rtp) = self.rtp_session {
                                                     rtp.set_remote_addr(addr);
                                                     println!("RTP remote: {}", addr);
-                                                    let (arx, stx) = rtp.start_receiving(1024);
-                                                    rtp_audio_rx = Some(arx);
+                                                    let (erx, stx) = rtp.start_receiving_events(
+                                                        1024,
+                                                        self.remote_dtmf_payload_type,
+                                                    );
+                                                    rtp_event_rx = Some(erx);
                                                     rtp_stop_tx = Some(stx);
                                                     rtp_connected = true;
                                                 }
@@ -346,6 +492,20 @@ impl SoftPhone {
                                 println!("Remote party hung up");
                                 dialog.process_bye(&msg);
                                 break;
+                            } else if *method == SipMethod::Info {
+                                if let Some((digit, duration)) = parse_info_dtmf(msg.body()) {
+                                    println!(
+                                        "DTMF received (SIP INFO): {} (duration {})",
+                                        digit, duration
+                                    );
+                                } else {
+                                    println!("SIP INFO received");
+                                }
+                                if let SipMessage::Request(ref req) = msg {
+                                    let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                                    debugger.capture_outgoing(&ok, local_addr, incoming.source);
+                                    self.transport.send_to(&ok, incoming.source).await?;
+                                }
                             }
                         }
 
@@ -374,11 +534,15 @@ impl SoftPhone {
                                     println!("  sniff verbose      Start with full headers/bodies");
                                     println!("  sniff stop         Stop SIP packet tracing");
                                     println!("  flows              Show call flow ladder diagrams");
+                                    println!("  dtmf <digits>      Queue DTMF over RTP (RFC2833)");
+                                    println!("  dtmf-info <digits> Queue DTMF over SIP INFO");
+                                    println!("  dtmf-send          Send queued DTMF digits now");
+                                    println!("  dtmf-queue         Show queued DTMF digits count");
                                     println!("  hangup | bye       End the call");
                                     println!("  help               Show this help");
                                 }
                                 "record" | "rec" => {
-                                    if recorder.is_some() {
+                                    if recorder.is_some() || live_recorder.is_some() {
                                         recording_active = true;
                                         println!("Recording resumed.");
                                     } else if parts.len() < 2 {
@@ -386,7 +550,7 @@ impl SoftPhone {
                                     } else {
                                         // Create a new recorder on the fly
                                         self.pending_record_path = Some(parts[1].to_string());
-                                        recorder = Some(self.live_recorder.insert(AudioRecorder::new(8000)));
+                                        live_recorder = Some(AudioRecorder::new(8000));
                                         recording_active = true;
                                         println!("Recording to: {}", parts[1]);
                                     }
@@ -394,7 +558,10 @@ impl SoftPhone {
                                 "stop" => {
                                     if recording_active {
                                         recording_active = false;
-                                        if let Some(ref rec) = recorder {
+                                        if let Some(rec) = recorder.as_deref() {
+                                            println!("Recording paused ({:.1}s captured, {} frames)",
+                                                rec.duration_ms() as f64 / 1000.0, rec.frame_count());
+                                        } else if let Some(rec) = live_recorder.as_ref() {
                                             println!("Recording paused ({:.1}s captured, {} frames)",
                                                 rec.duration_ms() as f64 / 1000.0, rec.frame_count());
                                         }
@@ -425,7 +592,11 @@ impl SoftPhone {
                                         println!("  Packets TX:{}", s.packets_sent);
                                         println!("  SSRC:      0x{:08X}", s.ssrc);
                                     }
-                                    if let Some(ref rec) = recorder {
+                                    if let Some(rec) = recorder.as_deref() {
+                                        println!("  Recording: {} ({:.1}s, {} frames)",
+                                            if recording_active { "active" } else { "paused" },
+                                            rec.duration_ms() as f64 / 1000.0, rec.frame_count());
+                                    } else if let Some(rec) = live_recorder.as_ref() {
                                         println!("  Recording: {} ({:.1}s, {} frames)",
                                             if recording_active { "active" } else { "paused" },
                                             rec.duration_ms() as f64 / 1000.0, rec.frame_count());
@@ -454,6 +625,33 @@ impl SoftPhone {
                                         debugger.print_summary();
                                         debugger.print_flows();
                                     }
+                                }
+                                "dtmf" => {
+                                    if parts.len() < 2 {
+                                        println!("Usage: dtmf <digits>");
+                                    } else {
+                                        let queued = self.queue_dtmf_digits(parts[1], DtmfMethod::Rfc2833);
+                                        if queued > 0 {
+                                            println!("Queued {} DTMF digit(s) for RTP RFC2833.", queued);
+                                        }
+                                    }
+                                }
+                                "dtmf-info" | "dtmf_info" => {
+                                    if parts.len() < 2 {
+                                        println!("Usage: dtmf-info <digits>");
+                                    } else {
+                                        let queued = self.queue_dtmf_digits(parts[1], DtmfMethod::SipInfo);
+                                        if queued > 0 {
+                                            println!("Queued {} DTMF digit(s) for SIP INFO.", queued);
+                                        }
+                                    }
+                                }
+                                "dtmf-send" | "send-dtmf" => {
+                                    let sent = self.flush_dtmf_queue(local_addr, &mut debugger).await?;
+                                    println!("Sent {} queued DTMF digit(s).", sent);
+                                }
+                                "dtmf-queue" => {
+                                    println!("Queued DTMF digits: {}", self.dtmf_queue.len());
                                 }
                                 "hangup" | "bye" | "quit" | "exit" | "q" => {
                                     println!("Hanging up...");
@@ -489,14 +687,38 @@ impl SoftPhone {
                 // Send silence frames to keep RTP flowing (NAT traversal)
                 _ = silence_interval.tick(), if rtp_connected => {
                     if let Some(ref mut rtp) = self.rtp_session {
-                        if muted {
-                            let silence = vec![0i16; 160];
-                            let _ = rtp.send_audio(&silence).await;
-                        } else {
-                            let silence = vec![0i16; 160]; // TODO: send mic audio when capture is wired up
-                            let _ = rtp.send_audio(&silence).await;
+                        let mut tx_frame: Option<Vec<i16>> = None;
+                        if !muted {
+                            #[cfg(feature = "audio-device")]
+                            {
+                                if let Some(capture) = mic_capture.as_mut() {
+                                    if let Ok(Some(frame)) = tokio::time::timeout(
+                                        std::time::Duration::from_millis(5),
+                                        capture.next_frame(),
+                                    )
+                                    .await
+                                    {
+                                        tx_frame = Some(frame);
+                                    }
+                                }
+                            }
+                        }
+                        let frame = tx_frame.unwrap_or_else(|| vec![0i16; 160]);
+                        if let Ok(sent) = rtp.send_audio(&frame).await {
+                            if !announced_audio_tx && sent > 0 {
+                                let s = rtp.stats();
+                                let codec = s.codec;
+                                println!(
+                                    "Audio TX active: codec={} PT={} rate={}Hz",
+                                    codec,
+                                    codec.payload_type(),
+                                    codec.clock_rate()
+                                );
+                                announced_audio_tx = true;
+                            }
                         }
                     }
+                    let _ = self.flush_dtmf_queue(local_addr, &mut debugger).await;
                 }
             }
         }
@@ -506,7 +728,119 @@ impl SoftPhone {
             let _ = stop.send(()).await;
         }
 
+        self.live_recorder = live_recorder;
+
         Ok(())
+    }
+
+    pub fn queue_rfc2833_dtmf(&mut self, digits: &str) -> usize {
+        self.queue_dtmf_digits(digits, DtmfMethod::Rfc2833)
+    }
+
+    pub fn queue_sip_info_dtmf(&mut self, digits: &str) -> usize {
+        self.queue_dtmf_digits(digits, DtmfMethod::SipInfo)
+    }
+
+    pub fn queued_dtmf_count(&self) -> usize {
+        self.dtmf_queue.len()
+    }
+
+    fn queue_dtmf_digits(&mut self, digits: &str, method: DtmfMethod) -> usize {
+        let mut count = 0usize;
+        for ch in digits.chars().filter(|c| !c.is_whitespace()) {
+            if is_valid_dtmf_digit(ch) {
+                self.dtmf_queue.push_back(QueuedDtmf {
+                    digit: ch.to_ascii_uppercase(),
+                    method,
+                });
+                count += 1;
+            } else {
+                println!("Ignoring unsupported DTMF digit '{}'", ch);
+            }
+        }
+        count
+    }
+
+    async fn flush_dtmf_queue(
+        &mut self,
+        local_addr: SocketAddr,
+        debugger: &mut SipDebugger,
+    ) -> Result<usize, PhoneError> {
+        if self.dtmf_queue.is_empty() {
+            return Ok(0);
+        }
+        let mut sent = 0usize;
+        while let Some(item) = self.dtmf_queue.pop_front() {
+            match item.method {
+                DtmfMethod::Rfc2833 => {
+                    let Some(ref mut rtp) = self.rtp_session else {
+                        break;
+                    };
+                    let payload_type = self.remote_dtmf_payload_type.unwrap_or(self.local_dtmf_payload_type);
+                    if let Err(e) = rtp.send_rfc2833_digit(item.digit, payload_type).await {
+                        println!("Failed to send RTP DTMF '{}': {}", item.digit, e);
+                    } else {
+                        println!("DTMF sent (RTP RFC2833): {}", item.digit);
+                        sent += 1;
+                    }
+                }
+                DtmfMethod::SipInfo => {
+                    if let Some(info) = self.build_dtmf_info(item.digit) {
+                        if let Some(target) = self.remote_sip_addr {
+                            debugger.capture_outgoing(&info, local_addr, target);
+                            self.transport.send_to(&info, target).await?;
+                            println!("DTMF sent (SIP INFO): {}", item.digit);
+                            sent += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    fn build_dtmf_info(&mut self, digit: char) -> Option<SipMessage> {
+        let dialog = self.dialog.as_mut()?;
+        let cseq = dialog.next_cseq();
+        let remote_target = dialog
+            .remote_target
+            .as_deref()
+            .unwrap_or(&dialog.remote_uri);
+        let body = format!("Signal={}\r\nDuration=160", digit);
+        Some(
+            RequestBuilder::new(SipMethod::Info, remote_target)
+                .header(
+                    HeaderName::Via,
+                    format!(
+                        "SIP/2.0/UDP {};branch={};rport",
+                        self.transport.local_addr(),
+                        generate_branch()
+                    ),
+                )
+                .header(HeaderName::MaxForwards, "70")
+                .header(
+                    HeaderName::From,
+                    format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
+                )
+                .header(
+                    HeaderName::To,
+                    format!(
+                        "<{}>{}",
+                        dialog.remote_uri,
+                        dialog.remote_tag
+                            .as_ref()
+                            .map(|t| format!(";tag={}", t))
+                            .unwrap_or_default()
+                    ),
+                )
+                .header(HeaderName::CallId, &dialog.call_id)
+                .header(HeaderName::CSeq, format!("{} INFO", cseq))
+                .header(HeaderName::ContentType, "application/dtmf-relay")
+                .header(HeaderName::Other("Info-Package".to_string()), "dtmf")
+                .header(HeaderName::UserAgent, "siphone/0.1.0")
+                .body(body)
+                .build(),
+        )
     }
 
     /// Get the path and recorder for any live-started recording
@@ -534,6 +868,17 @@ fn extract_host_from_uri(uri: &str) -> Option<String> {
         Some(host.to_string())
     } else {
         Some(without_scheme.to_string())
+    }
+}
+
+/// Extract user from SIP URI: sip:user@host -> user
+fn extract_user_from_uri(uri: &str) -> Option<String> {
+    let without_scheme = uri.strip_prefix("sip:").unwrap_or(uri);
+    let (user, _) = without_scheme.split_once('@')?;
+    if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
     }
 }
 
@@ -649,6 +994,37 @@ fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
     )))
 }
 
+fn is_valid_dtmf_digit(ch: char) -> bool {
+    matches!(ch.to_ascii_uppercase(), '0'..='9' | '*' | '#' | 'A' | 'B' | 'C' | 'D')
+}
+
+fn parse_info_dtmf(body: Option<&str>) -> Option<(char, u16)> {
+    let body = body?;
+    let mut signal: Option<char> = None;
+    let mut duration: Option<u16> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            if key == "signal" {
+                let d = val.chars().next()?;
+                if is_valid_dtmf_digit(d) {
+                    signal = Some(d.to_ascii_uppercase());
+                }
+            } else if key == "duration" {
+                duration = val.parse::<u16>().ok();
+            }
+        } else if let Some(val) = line.strip_prefix("Signal=") {
+            let d = val.trim().chars().next()?;
+            if is_valid_dtmf_digit(d) {
+                signal = Some(d.to_ascii_uppercase());
+            }
+        }
+    }
+    signal.map(|d| (d, duration.unwrap_or(160)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,11 +1057,47 @@ mod tests {
         assert_eq!(extract_host_from_uri("sip:example.com"), Some("example.com".into()));
     }
 
+    #[test]
+    fn test_extract_user_from_uri() {
+        assert_eq!(extract_user_from_uri("sip:bob@example.com"), Some("bob".into()));
+        assert_eq!(extract_user_from_uri("sip:2234@135.125.159.46"), Some("2234".into()));
+        assert_eq!(extract_user_from_uri("sip:example.com"), None);
+    }
+
+    #[test]
+    fn test_parse_info_dtmf_body() {
+        let parsed = parse_info_dtmf(Some("Signal=5\r\nDuration=240"));
+        assert_eq!(parsed, Some(('5', 240)));
+
+        let parsed = parse_info_dtmf(Some("Signal=#"));
+        assert_eq!(parsed, Some(('#', 160)));
+
+        assert_eq!(parse_info_dtmf(Some("Signal=Z\r\nDuration=10")), None);
+        assert_eq!(parse_info_dtmf(None), None);
+    }
+
+    #[test]
+    fn test_is_valid_dtmf_digit() {
+        assert!(is_valid_dtmf_digit('0'));
+        assert!(is_valid_dtmf_digit('*'));
+        assert!(is_valid_dtmf_digit('D'));
+        assert!(is_valid_dtmf_digit('a'));
+        assert!(!is_valid_dtmf_digit('Z'));
+    }
+
     #[tokio::test]
     async fn test_softphone_creation() {
         let phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
         assert!(phone.dialog().is_none());
         assert!(phone.local_addr().port() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_softphone_dtmf_queue_api() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        assert_eq!(phone.queue_rfc2833_dtmf("12#"), 3);
+        assert_eq!(phone.queue_sip_info_dtmf("A"), 1);
+        assert_eq!(phone.queued_dtmf_count(), 4);
     }
 
     #[tokio::test]
@@ -729,7 +1141,7 @@ mod tests {
             .call(
                 "sip:bob@example.com",
                 Some(&server_addr.to_string()),
-                "alice",
+                Some("alice"),
             )
             .await
             .unwrap();
@@ -769,8 +1181,19 @@ mod tests {
 
         // Call with server extracted from URI
         let uri = format!("sip:bob@{}", server_addr);
-        phone.call(&uri, None, "alice").await.unwrap();
+        phone.call(&uri, None, Some("alice")).await.unwrap();
 
+        assert!(phone.dialog().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_softphone_call_auto_user_from_uri() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let uri = format!("sip:bob@{}", server_addr);
+        phone.call(&uri, None, None).await.unwrap();
         assert!(phone.dialog().is_some());
     }
 }

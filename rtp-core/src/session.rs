@@ -1,6 +1,7 @@
 use crate::codec::{CodecPipeline, CodecType, CodecError};
 use crate::jitter::JitterBuffer;
 use crate::packet::RtpPacket;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -17,6 +18,30 @@ pub enum SessionError {
     Rtp(#[from] crate::packet::RtpError),
     #[error("session not started")]
     NotStarted,
+    #[error("invalid DTMF digit: {0}")]
+    InvalidDtmfDigit(char),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtmfEvent {
+    pub digit: char,
+    pub end: bool,
+    pub duration: u16,
+    pub volume: u8,
+    pub sequence_number: u16,
+    pub timestamp: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiveEvent {
+    Audio(Vec<i16>),
+    Dtmf(DtmfEvent),
+}
+
+#[derive(Debug, Clone)]
+struct QueuedDtmf {
+    digit: char,
+    duration_samples: u16,
 }
 
 /// Configuration for an RTP session
@@ -49,6 +74,7 @@ pub struct RtpSession {
     sequence_number: u16,
     timestamp: u32,
     local_addr: SocketAddr,
+    dtmf_queue: VecDeque<QueuedDtmf>,
 }
 
 impl RtpSession {
@@ -65,6 +91,7 @@ impl RtpSession {
             sequence_number: 0,
             timestamp: 0,
             local_addr,
+            dtmf_queue: VecDeque::new(),
         })
     }
 
@@ -98,6 +125,96 @@ impl RtpSession {
             .timestamp
             .wrapping_add(self.config.codec.samples_per_frame() as u32);
 
+        Ok(sent)
+    }
+
+    /// Send one RFC2833 telephone-event digit.
+    ///
+    /// `payload_type` is typically negotiated via SDP `a=rtpmap:<pt> telephone-event/8000`.
+    pub async fn send_rfc2833_digit(
+        &mut self,
+        digit: char,
+        payload_type: u8,
+    ) -> Result<(), SessionError> {
+        self.send_rfc2833_digit_with_duration(digit, payload_type, 800).await
+    }
+
+    async fn send_rfc2833_digit_with_duration(
+        &mut self,
+        digit: char,
+        payload_type: u8,
+        duration_samples: u16,
+    ) -> Result<(), SessionError> {
+        let event = dtmf_digit_to_event(digit).ok_or(SessionError::InvalidDtmfDigit(digit))?;
+        let start_ts = self.timestamp;
+        let ramps = [160u16, 320u16, duration_samples];
+        for (idx, dur) in ramps.iter().enumerate() {
+            let end = idx == ramps.len() - 1;
+            let marker = idx == 0;
+            let payload = vec![
+                event,
+                ((end as u8) << 7) | 10u8, // volume 10
+                (dur >> 8) as u8,
+                (*dur & 0xFF) as u8,
+            ];
+            let packet = RtpPacket::new(payload_type, self.sequence_number, start_ts, self.config.ssrc)
+                .with_marker(marker)
+                .with_payload(payload);
+            let data = packet.serialize();
+            self.socket.send_to(&data, self.config.remote_addr).await?;
+            self.sequence_number = self.sequence_number.wrapping_add(1);
+        }
+        // Advance sender clock by event duration so subsequent media timing moves forward.
+        self.timestamp = self.timestamp.wrapping_add(duration_samples as u32);
+        Ok(())
+    }
+
+    /// Queue DTMF digits for RFC2833 transmission.
+    ///
+    /// Returns the number of queued digits.
+    pub fn queue_rfc2833_digits(&mut self, digits: &str) -> Result<usize, SessionError> {
+        let mut queued = 0usize;
+        for ch in digits.chars().filter(|c| !c.is_whitespace()) {
+            validate_dtmf_digit(ch)?;
+            self.dtmf_queue.push_back(QueuedDtmf {
+                digit: ch.to_ascii_uppercase(),
+                duration_samples: 800,
+            });
+            queued += 1;
+        }
+        Ok(queued)
+    }
+
+    pub fn queued_rfc2833_digits(&self) -> usize {
+        self.dtmf_queue.len()
+    }
+
+    /// Send the next queued RFC2833 DTMF digit.
+    pub async fn send_next_queued_rfc2833(
+        &mut self,
+        payload_type: u8,
+    ) -> Result<Option<char>, SessionError> {
+        let Some(next) = self.dtmf_queue.pop_front() else {
+            return Ok(None);
+        };
+        self.send_rfc2833_digit_with_duration(next.digit, payload_type, next.duration_samples)
+            .await?;
+        Ok(Some(next.digit))
+    }
+
+    /// Flush the queued RFC2833 digits with an inter-digit gap.
+    pub async fn flush_queued_rfc2833(
+        &mut self,
+        payload_type: u8,
+        inter_digit_gap_ms: u64,
+    ) -> Result<usize, SessionError> {
+        let mut sent = 0usize;
+        while let Some(_digit) = self.send_next_queued_rfc2833(payload_type).await? {
+            sent += 1;
+            if !self.dtmf_queue.is_empty() && inter_digit_gap_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(inter_digit_gap_ms)).await;
+            }
+        }
         Ok(sent)
     }
 
@@ -197,6 +314,81 @@ impl RtpSession {
         (audio_rx, stop_tx)
     }
 
+    /// Start a receive loop that emits both decoded audio and RFC2833 DTMF events.
+    pub fn start_receiving_events(
+        &self,
+        buffer_size: usize,
+        dtmf_payload_type: Option<u8>,
+    ) -> (
+        mpsc::Receiver<ReceiveEvent>,
+        mpsc::Sender<()>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(buffer_size);
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let socket = self.socket.clone();
+        let codec_type = self.config.codec;
+        let jitter_size = self.config.jitter_buffer_size;
+
+        tokio::spawn(async move {
+            let codec = CodecPipeline::new(codec_type);
+            let mut jitter = JitterBuffer::new(jitter_size);
+            let mut buf = vec![0u8; 65535];
+
+            loop {
+                tokio::select! {
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, _source)) => {
+                                match RtpPacket::parse(&buf[..len]) {
+                                    Ok(packet) => {
+                                        if let Some(pt) = dtmf_payload_type {
+                                            if packet.payload_type == pt {
+                                                if let Some(dtmf) = parse_rfc2833_event(&packet) {
+                                                    match event_tx.try_send(ReceiveEvent::Dtmf(dtmf)) {
+                                                        Ok(_) => {}
+                                                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                                                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                                    }
+                                                }
+                                                continue;
+                                            }
+                                        }
+
+                                        jitter.insert(packet);
+                                        if let Some(pkt) = jitter.pop() {
+                                            match codec.decode(&pkt.payload) {
+                                                Ok(samples) => {
+                                                    match event_tx.try_send(ReceiveEvent::Audio(samples)) {
+                                                        Ok(_) => {}
+                                                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                                                        Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                                    }
+                                                }
+                                                Err(_e) => {
+                                                    tracing::warn!("RTP decode error: {}", _e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("RTP receive error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    _ = stop_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (event_rx, stop_tx)
+    }
+
     /// Get session statistics
     pub fn stats(&self) -> SessionStats {
         SessionStats {
@@ -212,6 +404,69 @@ impl RtpSession {
     pub fn codec(&self) -> &CodecPipeline {
         &self.codec
     }
+}
+
+fn validate_dtmf_digit(digit: char) -> Result<(), SessionError> {
+    if dtmf_digit_to_event(digit).is_some() {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidDtmfDigit(digit))
+    }
+}
+
+fn dtmf_digit_to_event(digit: char) -> Option<u8> {
+    match digit.to_ascii_uppercase() {
+        '0' => Some(0),
+        '1' => Some(1),
+        '2' => Some(2),
+        '3' => Some(3),
+        '4' => Some(4),
+        '5' => Some(5),
+        '6' => Some(6),
+        '7' => Some(7),
+        '8' => Some(8),
+        '9' => Some(9),
+        '*' => Some(10),
+        '#' => Some(11),
+        'A' => Some(12),
+        'B' => Some(13),
+        'C' => Some(14),
+        'D' => Some(15),
+        _ => None,
+    }
+}
+
+fn dtmf_event_to_digit(event: u8) -> Option<char> {
+    match event {
+        0..=9 => Some((b'0' + event) as char),
+        10 => Some('*'),
+        11 => Some('#'),
+        12 => Some('A'),
+        13 => Some('B'),
+        14 => Some('C'),
+        15 => Some('D'),
+        _ => None,
+    }
+}
+
+fn parse_rfc2833_event(packet: &RtpPacket) -> Option<DtmfEvent> {
+    if packet.payload.len() < 4 {
+        return None;
+    }
+    let event = packet.payload[0];
+    let e_r_volume = packet.payload[1];
+    let end = (e_r_volume & 0x80) != 0;
+    let volume = e_r_volume & 0x3F;
+    let duration = u16::from_be_bytes([packet.payload[2], packet.payload[3]]);
+    let digit = dtmf_event_to_digit(event)?;
+    Some(DtmfEvent {
+        digit,
+        end,
+        duration,
+        volume,
+        sequence_number: packet.sequence_number,
+        timestamp: packet.timestamp,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -384,5 +639,62 @@ mod tests {
         let received = RtpPacket::parse(&buf[..len]).unwrap();
         assert_eq!(received.sequence_number, 42);
         assert_eq!(received.ssrc, 0xBEEF);
+    }
+
+    #[tokio::test]
+    async fn test_send_rfc2833_digit_packet_shape() {
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_socket.local_addr().unwrap();
+        let config = SessionConfig::new("127.0.0.1:0", recv_addr, CodecType::Pcmu);
+        let mut sender = RtpSession::new(config).await.unwrap();
+
+        sender.send_rfc2833_digit('5', 101).await.unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = recv_socket.recv_from(&mut buf).await.unwrap();
+        let pkt = RtpPacket::parse(&buf[..len]).unwrap();
+        assert_eq!(pkt.payload_type, 101);
+        assert!(pkt.marker);
+        assert_eq!(pkt.payload[0], 5);
+    }
+
+    #[tokio::test]
+    async fn test_queue_and_flush_rfc2833_digits() {
+        let recv_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let recv_addr = recv_socket.local_addr().unwrap();
+        let config = SessionConfig::new("127.0.0.1:0", recv_addr, CodecType::Pcmu);
+        let mut sender = RtpSession::new(config).await.unwrap();
+
+        let queued = sender.queue_rfc2833_digits("12#").unwrap();
+        assert_eq!(queued, 3);
+        assert_eq!(sender.queued_rfc2833_digits(), 3);
+
+        let sent = sender.flush_queued_rfc2833(101, 0).await.unwrap();
+        assert_eq!(sent, 3);
+        assert_eq!(sender.queued_rfc2833_digits(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_receive_event_reports_dtmf() {
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let recv_config = SessionConfig::new("127.0.0.1:0", remote_addr, CodecType::Pcmu);
+        let recv_session = RtpSession::new(recv_config).await.unwrap();
+        let recv_addr = recv_session.local_addr();
+        let (mut events, stop_tx) = recv_session.start_receiving_events(16, Some(101));
+
+        let send_config = SessionConfig::new("127.0.0.1:0", recv_addr, CodecType::Pcmu);
+        let mut send_session = RtpSession::new(send_config).await.unwrap();
+        send_session.send_rfc2833_digit('9', 101).await.unwrap();
+
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match evt {
+            ReceiveEvent::Dtmf(dtmf) => assert_eq!(dtmf.digit, '9'),
+            ReceiveEvent::Audio(_) => panic!("expected DTMF event"),
+        }
+
+        let _ = stop_tx.send(()).await;
     }
 }
