@@ -1,0 +1,17 @@
+[workspace]
+members = ["sip-core", "rtp-core", "siphone"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "1"
