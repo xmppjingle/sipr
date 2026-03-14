@@ -78,14 +78,41 @@ pub enum CodecError {
 /// Codec pipeline for encoding/decoding audio frames.
 ///
 /// For PCMU/PCMA, we implement the G.711 codec directly.
-/// For Opus, we provide a stub since the real Opus codec requires native bindings.
+/// For Opus, uses the audiopus crate when the "opus" feature is enabled,
+/// otherwise falls back to a raw-bytes stub.
 pub struct CodecPipeline {
     codec: CodecType,
+    #[cfg(feature = "opus")]
+    opus_encoder: Option<audiopus::coder::Encoder>,
+    #[cfg(feature = "opus")]
+    opus_decoder: Option<audiopus::coder::Decoder>,
 }
 
 impl CodecPipeline {
     pub fn new(codec: CodecType) -> Self {
-        Self { codec }
+        #[cfg(feature = "opus")]
+        let (opus_encoder, opus_decoder) = if codec == CodecType::Opus {
+            let enc = audiopus::coder::Encoder::new(
+                audiopus::SampleRate::Hz48000,
+                audiopus::Channels::Mono,
+                audiopus::Application::Voip,
+            ).ok();
+            let dec = audiopus::coder::Decoder::new(
+                audiopus::SampleRate::Hz48000,
+                audiopus::Channels::Mono,
+            ).ok();
+            (enc, dec)
+        } else {
+            (None, None)
+        };
+
+        Self {
+            codec,
+            #[cfg(feature = "opus")]
+            opus_encoder,
+            #[cfg(feature = "opus")]
+            opus_decoder,
+        }
     }
 
     pub fn codec_type(&self) -> CodecType {
@@ -93,13 +120,22 @@ impl CodecPipeline {
     }
 
     /// Encode PCM samples (16-bit linear, mono) to codec format
-    pub fn encode(&self, pcm_samples: &[i16]) -> Result<Vec<u8>, CodecError> {
+    pub fn encode(&mut self, pcm_samples: &[i16]) -> Result<Vec<u8>, CodecError> {
         match self.codec {
             CodecType::Pcmu => Ok(pcm_samples.iter().map(|&s| linear_to_ulaw(s)).collect()),
             CodecType::Pcma => Ok(pcm_samples.iter().map(|&s| linear_to_alaw(s)).collect()),
             CodecType::Opus => {
-                // Stub: in a real implementation, this would use the opus crate.
-                // For now, we just encode as raw bytes for testing.
+                #[cfg(feature = "opus")]
+                {
+                    if let Some(ref mut enc) = self.opus_encoder {
+                        let mut output = vec![0u8; 4000]; // max opus frame
+                        let len = enc.encode(pcm_samples, &mut output)
+                            .map_err(|e| CodecError::EncodingError(format!("opus encode: {}", e)))?;
+                        output.truncate(len);
+                        return Ok(output);
+                    }
+                }
+                // Stub fallback: encode as raw bytes
                 let mut bytes = Vec::with_capacity(pcm_samples.len() * 2);
                 for &sample in pcm_samples {
                     bytes.extend_from_slice(&sample.to_le_bytes());
@@ -110,12 +146,26 @@ impl CodecPipeline {
     }
 
     /// Decode codec format to PCM samples (16-bit linear, mono)
-    pub fn decode(&self, data: &[u8]) -> Result<Vec<i16>, CodecError> {
+    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<i16>, CodecError> {
         match self.codec {
             CodecType::Pcmu => Ok(data.iter().map(|&b| ulaw_to_linear(b)).collect()),
             CodecType::Pcma => Ok(data.iter().map(|&b| alaw_to_linear(b)).collect()),
             CodecType::Opus => {
-                // Stub: decode raw bytes back to samples
+                #[cfg(feature = "opus")]
+                {
+                    if let Some(ref mut dec) = self.opus_decoder {
+                        let mut output = vec![0i16; 5760]; // max decode buffer
+                        let packet: audiopus::packet::Packet<'_> = data.try_into()
+                            .map_err(|e: audiopus::Error| CodecError::DecodingError(format!("opus packet: {}", e)))?;
+                        let signals: audiopus::MutSignals<'_, i16> = output.as_mut_slice().try_into()
+                            .map_err(|e: audiopus::Error| CodecError::DecodingError(format!("opus signals: {}", e)))?;
+                        let samples = dec.decode(Some(packet), signals, false)
+                            .map_err(|e| CodecError::DecodingError(format!("opus decode: {}", e)))?;
+                        output.truncate(samples);
+                        return Ok(output);
+                    }
+                }
+                // Stub fallback: decode raw bytes back to samples
                 if data.len() % 2 != 0 {
                     return Err(CodecError::DecodingError(
                         "invalid opus stub data length".to_string(),
@@ -278,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_pcmu_encode_decode_roundtrip() {
-        let codec = CodecPipeline::new(CodecType::Pcmu);
+        let mut codec = CodecPipeline::new(CodecType::Pcmu);
 
         // Test with various sample values
         let samples: Vec<i16> = vec![0, 100, -100, 1000, -1000, 8000, -8000, 32000, -32000];
@@ -302,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_pcma_encode_decode_roundtrip() {
-        let codec = CodecPipeline::new(CodecType::Pcma);
+        let mut codec = CodecPipeline::new(CodecType::Pcma);
 
         let samples: Vec<i16> = vec![0, 100, -100, 1000, -1000, 8000, -8000, 32000, -32000];
         let encoded = codec.encode(&samples).unwrap();
@@ -322,20 +372,25 @@ mod tests {
     }
 
     #[test]
-    fn test_opus_stub_roundtrip() {
-        let codec = CodecPipeline::new(CodecType::Opus);
-
-        let samples: Vec<i16> = vec![0, 100, -100, 1000, -1000, 32767, -32768];
+    fn test_opus_roundtrip() {
+        let mut codec = CodecPipeline::new(CodecType::Opus);
+        // Generate a simple tone for testing
+        let samples: Vec<i16> = (0..960)
+            .map(|i| ((i as f64 / 960.0 * std::f64::consts::TAU).sin() * 16000.0) as i16)
+            .collect();
         let encoded = codec.encode(&samples).unwrap();
         let decoded = codec.decode(&encoded).unwrap();
-
-        // Stub is lossless
-        assert_eq!(samples, decoded);
+        // Opus is lossy but output should have correct number of samples
+        assert_eq!(decoded.len(), 960);
+        // Verify the decoded audio isn't silence (some energy preserved)
+        let max_sample = decoded.iter().map(|s| s.abs()).max().unwrap_or(0);
+        assert!(max_sample > 1000, "Expected audio energy, max sample was {}", max_sample);
     }
 
+    #[cfg(not(feature = "opus"))]
     #[test]
     fn test_opus_stub_decode_odd_length() {
-        let codec = CodecPipeline::new(CodecType::Opus);
+        let mut codec = CodecPipeline::new(CodecType::Opus);
         let result = codec.decode(&[0, 1, 2]); // Odd number of bytes
         assert!(result.is_err());
     }
@@ -358,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_pcmu_encode_silence() {
-        let codec = CodecPipeline::new(CodecType::Pcmu);
+        let mut codec = CodecPipeline::new(CodecType::Pcmu);
         let silence_pcm = vec![0i16; 160];
         let encoded = codec.encode(&silence_pcm).unwrap();
         assert_eq!(encoded.len(), 160);
@@ -384,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_pcmu_full_frame() {
-        let codec = CodecPipeline::new(CodecType::Pcmu);
+        let mut codec = CodecPipeline::new(CodecType::Pcmu);
         // Generate a sine-like wave
         let samples: Vec<i16> = (0..160)
             .map(|i| ((i as f64 / 160.0 * std::f64::consts::TAU).sin() * 16000.0) as i16)

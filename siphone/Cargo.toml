@@ -24,6 +24,7 @@ uuid = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 chrono = "0.4"
+hickory-resolver = "0.24"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

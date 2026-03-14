@@ -326,7 +326,7 @@ async fn e2e_rtp_audio_exchange() {
     let sender_addr = sender.local_addr();
 
     let receiver_config = SessionConfig::new("127.0.0.1:0", sender_addr, CodecType::Pcmu);
-    let receiver = RtpSession::new(receiver_config).await.unwrap();
+    let mut receiver = RtpSession::new(receiver_config).await.unwrap();
     let receiver_addr = receiver.local_addr();
 
     // Update sender to point at receiver (we needed receiver's addr first)
@@ -373,7 +373,7 @@ async fn e2e_rtp_audio_exchange() {
 #[tokio::test]
 async fn e2e_rtp_jitter_buffer_integration() {
     // Simulate out-of-order packet delivery through the jitter buffer
-    let codec = CodecPipeline::new(CodecType::Pcmu);
+    let mut codec = CodecPipeline::new(CodecType::Pcmu);
     let mut jitter = JitterBuffer::new(20);
 
     // Create packets with known content
@@ -488,7 +488,7 @@ async fn e2e_sip_rtp_integrated_call() {
         caller_audio_port,
     );
     let callee_rtp_config = SessionConfig::new("127.0.0.1:0", callee_rtp_remote, CodecType::Pcmu);
-    let callee_rtp = RtpSession::new(callee_rtp_config).await.unwrap();
+    let mut callee_rtp = RtpSession::new(callee_rtp_config).await.unwrap();
     let callee_rtp_port = callee_rtp.local_addr().port();
 
     let mut callee_sdp = SdpSession::new("127.0.0.1");
@@ -798,8 +798,8 @@ async fn e2e_sdp_codec_negotiation() {
     );
 
     // Both sides can now use PCMU
-    let caller_codec = CodecPipeline::new(CodecType::Pcmu);
-    let callee_codec = CodecPipeline::new(CodecType::Pcmu);
+    let mut caller_codec = CodecPipeline::new(CodecType::Pcmu);
+    let mut callee_codec = CodecPipeline::new(CodecType::Pcmu);
 
     let samples = vec![5000i16; 160];
     let encoded = caller_codec.encode(&samples).unwrap();
@@ -1058,7 +1058,7 @@ async fn e2e_two_instance_call_with_audio_recording() {
     let bob_rtp_config = SessionConfig::new(
         &format!("127.0.0.1:{}", bob_rtp_port), bob_rtp_remote, CodecType::Pcmu,
     );
-    let bob_rtp = RtpSession::new(bob_rtp_config).await.unwrap();
+    let mut bob_rtp = RtpSession::new(bob_rtp_config).await.unwrap();
 
     // --- Generate test audio: 440Hz sine tone, 10 frames (200ms) ---
     let original_tone = generate_sine_tone(440.0, 8000, 200, 12000);
@@ -1212,7 +1212,7 @@ async fn e2e_audio_pipeline_wav_roundtrip() {
     let config_a = SessionConfig::new(&addr_a.to_string(), addr_b, CodecType::Pcmu);
     let mut session_a = RtpSession::new(config_a).await.unwrap();
     let config_b = SessionConfig::new(&addr_b.to_string(), addr_a, CodecType::Pcmu);
-    let session_b = RtpSession::new(config_b).await.unwrap();
+    let mut session_b = RtpSession::new(config_b).await.unwrap();
 
     // Generate a multi-tone signal for richer fidelity testing
     let original = generate_multi_tone(&[300.0, 700.0, 1200.0], 8000, 400, 10000);
@@ -1280,7 +1280,7 @@ async fn e2e_alaw_audio_recording_fidelity() {
     let config_a = SessionConfig::new(&addr_a.to_string(), addr_b, CodecType::Pcma);
     let mut session_a = RtpSession::new(config_a).await.unwrap();
     let config_b = SessionConfig::new(&addr_b.to_string(), addr_a, CodecType::Pcma);
-    let session_b = RtpSession::new(config_b).await.unwrap();
+    let mut session_b = RtpSession::new(config_b).await.unwrap();
 
     let original = generate_sine_tone(600.0, 8000, 200, 12000);
     let mut recorder = AudioRecorder::new(8000);
@@ -2002,4 +2002,508 @@ async fn e2e_sniff_full_call_flow_capture() {
     for (_, _, msg) in &captured_at_uac {
         assert_eq!(msg.call_id().unwrap(), call_id);
     }
+}
+
+// =============================================================================
+// E2E Test: Digest Authentication (401 challenge-response)
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_digest_auth_register() {
+    use sip_core::auth::{parse_challenge, compute_digest, Credentials};
+
+    let uac = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uas = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uac_addr = uac.local_addr();
+    let uas_addr = uas.local_addr();
+
+    let call_id = "auth-test-call-id";
+    let local_tag = generate_tag();
+
+    // Step 1: UAC sends REGISTER (no auth)
+    let reg1 = RequestBuilder::new(SipMethod::Register, &format!("sip:{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, "<sip:alice@example.com>")
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 REGISTER")
+        .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+        .build();
+    uac.send_to(&reg1, uas_addr).await.unwrap();
+
+    // Step 2: UAS receives REGISTER, responds 401 with challenge
+    let incoming = uas.recv().await.unwrap();
+    assert_eq!(*incoming.message.method().unwrap(), SipMethod::Register);
+    assert!(incoming.message.headers().get(&HeaderName::Authorization).is_none());
+
+    if let SipMessage::Request(ref req) = incoming.message {
+        let challenge_resp = ResponseBuilder::from_request(req, StatusCode::UNAUTHORIZED)
+            .header(HeaderName::WwwAuthenticate,
+                r#"Digest realm="example.com", nonce="dcd98b7102dd2f0e", algorithm=MD5, qop="auth""#)
+            .build();
+        uas.send_to(&challenge_resp, incoming.source).await.unwrap();
+    }
+
+    // Step 3: UAC receives 401, computes digest, re-sends REGISTER
+    let resp = uac.recv().await.unwrap();
+    assert_eq!(resp.message.status().unwrap().0, 401);
+
+    let www_auth = resp.message.headers().get(&HeaderName::WwwAuthenticate).unwrap();
+    let challenge = parse_challenge(www_auth.as_str()).unwrap();
+    assert_eq!(challenge.realm, "example.com");
+    assert_eq!(challenge.nonce, "dcd98b7102dd2f0e");
+    assert_eq!(challenge.qop.as_deref(), Some("auth"));
+
+    let creds = Credentials { username: "alice".to_string(), password: "secret".to_string() };
+    let digest = compute_digest(&challenge, &creds, "REGISTER", &format!("sip:{}", uas_addr));
+    let auth_value = digest.to_string();
+    assert!(auth_value.contains("username=\"alice\""));
+    assert!(auth_value.contains("realm=\"example.com\""));
+
+    let reg2 = RequestBuilder::new(SipMethod::Register, &format!("sip:{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, "<sip:alice@example.com>")
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "2 REGISTER")
+        .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+        .header(HeaderName::Authorization, auth_value)
+        .build();
+    uac.send_to(&reg2, uas_addr).await.unwrap();
+
+    // Step 4: UAS receives authenticated REGISTER, responds 200 OK
+    let incoming2 = uas.recv().await.unwrap();
+    assert_eq!(*incoming2.message.method().unwrap(), SipMethod::Register);
+    let auth_header = incoming2.message.headers().get(&HeaderName::Authorization)
+        .expect("Second REGISTER must have Authorization");
+    assert!(auth_header.as_str().contains("response="));
+
+    if let SipMessage::Request(ref req) = incoming2.message {
+        let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+        uas.send_to(&ok, incoming2.source).await.unwrap();
+    }
+
+    let final_resp = uac.recv().await.unwrap();
+    assert!(final_resp.message.status().unwrap().is_success());
+}
+
+// =============================================================================
+// E2E Test: Call hold/resume via re-INVITE
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_call_hold_resume() {
+    let uac = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uas = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uac_addr = uac.local_addr();
+    let uas_addr = uas.local_addr();
+
+    let call_id = "hold-test-call-id";
+    let local_tag = generate_tag();
+    let remote_tag = generate_tag();
+
+    // Establish a call with initial INVITE
+    let mut sdp = SdpSession::new("127.0.0.1");
+    sdp.add_audio_media(4000);
+    let sdp_body = sdp.to_string();
+
+    let invite = RequestBuilder::new(SipMethod::Invite, &format!("sip:bob@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:bob@{}>", uas_addr))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 INVITE")
+        .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+        .header(HeaderName::ContentType, "application/sdp")
+        .body(&sdp_body)
+        .build();
+    uac.send_to(&invite, uas_addr).await.unwrap();
+
+    // UAS receives and sends 200 OK
+    let incoming = uas.recv().await.unwrap();
+    if let SipMessage::Request(ref req) = incoming.message {
+        let mut answer_sdp = SdpSession::new("127.0.0.1");
+        answer_sdp.add_audio_media(5000);
+        let answer_body = answer_sdp.to_string();
+        let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+            .header(HeaderName::Contact, format!("<sip:bob@{}>", uas_addr))
+            .header(HeaderName::To, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+            .header(HeaderName::ContentType, "application/sdp")
+            .body(&answer_body)
+            .build();
+        uas.send_to(&ok, incoming.source).await.unwrap();
+    }
+
+    let _ = uac.recv().await.unwrap(); // 200 OK
+
+    // Now UAC sends re-INVITE with a=sendonly (hold)
+    let mut hold_sdp = SdpSession::new("127.0.0.1");
+    hold_sdp.add_audio_media_directed(4000, "sendonly");
+    let hold_body = hold_sdp.to_string();
+
+    let reinvite = RequestBuilder::new(SipMethod::Invite, &format!("sip:bob@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "2 INVITE")
+        .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+        .header(HeaderName::ContentType, "application/sdp")
+        .body(&hold_body)
+        .build();
+    uac.send_to(&reinvite, uas_addr).await.unwrap();
+
+    // UAS receives re-INVITE and verifies it's a hold
+    let hold_incoming = uas.recv().await.unwrap();
+    assert_eq!(*hold_incoming.message.method().unwrap(), SipMethod::Invite);
+    let hold_sdp_parsed = SdpSession::parse(hold_incoming.message.body().unwrap()).unwrap();
+    assert_eq!(hold_sdp_parsed.get_audio_direction(), Some("sendonly"));
+
+    // UAS responds 200 OK to hold
+    if let SipMessage::Request(ref req) = hold_incoming.message {
+        let mut resp_sdp = SdpSession::new("127.0.0.1");
+        resp_sdp.add_audio_media_directed(5000, "recvonly");
+        let resp_body = resp_sdp.to_string();
+        let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+            .header(HeaderName::ContentType, "application/sdp")
+            .body(&resp_body)
+            .build();
+        uas.send_to(&ok, hold_incoming.source).await.unwrap();
+    }
+
+    let hold_resp = uac.recv().await.unwrap();
+    assert!(hold_resp.message.status().unwrap().is_success());
+
+    // Now UAC sends re-INVITE with a=sendrecv (resume)
+    let mut resume_sdp = SdpSession::new("127.0.0.1");
+    resume_sdp.add_audio_media_directed(4000, "sendrecv");
+    let resume_body = resume_sdp.to_string();
+
+    let reinvite2 = RequestBuilder::new(SipMethod::Invite, &format!("sip:bob@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "3 INVITE")
+        .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+        .header(HeaderName::ContentType, "application/sdp")
+        .body(&resume_body)
+        .build();
+    uac.send_to(&reinvite2, uas_addr).await.unwrap();
+
+    let resume_incoming = uas.recv().await.unwrap();
+    let resume_sdp_parsed = SdpSession::parse(resume_incoming.message.body().unwrap()).unwrap();
+    assert_eq!(resume_sdp_parsed.get_audio_direction(), Some("sendrecv"));
+}
+
+// =============================================================================
+// E2E Test: REFER for blind call transfer
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_refer_blind_transfer() {
+    let uac = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uas = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uac_addr = uac.local_addr();
+    let uas_addr = uas.local_addr();
+
+    let call_id = "refer-test-call-id";
+    let local_tag = generate_tag();
+    let remote_tag = generate_tag();
+
+    // UAC sends REFER
+    let refer = RequestBuilder::new(SipMethod::Refer, &format!("sip:bob@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 REFER")
+        .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+        .header(HeaderName::ReferTo, "sip:carol@example.com")
+        .header(HeaderName::ReferredBy, format!("<sip:alice@{}>", uac_addr))
+        .build();
+    uac.send_to(&refer, uas_addr).await.unwrap();
+
+    // UAS receives REFER
+    let incoming = uas.recv().await.unwrap();
+    assert_eq!(*incoming.message.method().unwrap(), SipMethod::Refer);
+
+    let refer_to = incoming.message.headers().get(&HeaderName::ReferTo)
+        .expect("REFER should have Refer-To");
+    assert_eq!(refer_to.as_str(), "sip:carol@example.com");
+
+    let referred_by = incoming.message.headers().get(&HeaderName::ReferredBy)
+        .expect("REFER should have Referred-By");
+    assert!(referred_by.as_str().contains("alice"));
+
+    // UAS sends 202 Accepted
+    if let SipMessage::Request(ref req) = incoming.message {
+        let accepted = ResponseBuilder::from_request(req, StatusCode::ACCEPTED).build();
+        uas.send_to(&accepted, incoming.source).await.unwrap();
+    }
+
+    let resp = uac.recv().await.unwrap();
+    assert_eq!(resp.message.status().unwrap().0, 202);
+
+    // UAS sends NOTIFY with sipfrag body
+    let notify = RequestBuilder::new(SipMethod::Notify, &format!("sip:alice@{}", uac_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uas_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+        .header(HeaderName::To, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 NOTIFY")
+        .header(HeaderName::Event, "refer")
+        .header(HeaderName::SubscriptionState, "terminated;reason=noresource")
+        .header(HeaderName::ContentType, "message/sipfrag")
+        .body("SIP/2.0 200 OK")
+        .build();
+    uas.send_to(&notify, uac_addr).await.unwrap();
+
+    let notify_incoming = uac.recv().await.unwrap();
+    assert_eq!(*notify_incoming.message.method().unwrap(), SipMethod::Notify);
+    assert_eq!(notify_incoming.message.body().unwrap().trim(), "SIP/2.0 200 OK");
+
+    let event = notify_incoming.message.headers().get(&HeaderName::Event).unwrap();
+    assert_eq!(event.as_str(), "refer");
+}
+
+// =============================================================================
+// E2E Test: PRACK for reliable provisional responses
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_prack_reliable_provisional() {
+    let uac = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uas = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uac_addr = uac.local_addr();
+    let uas_addr = uas.local_addr();
+
+    let call_id = "prack-test-call-id";
+    let local_tag = generate_tag();
+    let remote_tag = generate_tag();
+
+    // UAC sends INVITE
+    let invite = RequestBuilder::new(SipMethod::Invite, &format!("sip:bob@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:bob@{}>", uas_addr))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 INVITE")
+        .header(HeaderName::Supported, "100rel")
+        .build();
+    uac.send_to(&invite, uas_addr).await.unwrap();
+
+    // UAS receives INVITE
+    let incoming = uas.recv().await.unwrap();
+    assert_eq!(*incoming.message.method().unwrap(), SipMethod::Invite);
+
+    // UAS sends 183 Session Progress with Require: 100rel and RSeq
+    if let SipMessage::Request(ref req) = incoming.message {
+        let mut sdp = SdpSession::new("127.0.0.1");
+        sdp.add_audio_media(6000);
+        let sdp_body = sdp.to_string();
+        let provisional = ResponseBuilder::from_request(req, StatusCode::SESSION_PROGRESS)
+            .header(HeaderName::To, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+            .header(HeaderName::Require, "100rel")
+            .header(HeaderName::RSeq, "1")
+            .header(HeaderName::ContentType, "application/sdp")
+            .body(&sdp_body)
+            .build();
+        uas.send_to(&provisional, incoming.source).await.unwrap();
+    }
+
+    // UAC receives 183 with 100rel
+    let resp = uac.recv().await.unwrap();
+    assert_eq!(resp.message.status().unwrap().0, 183);
+
+    let require = resp.message.headers().get(&HeaderName::Require).unwrap();
+    assert!(require.as_str().contains("100rel"));
+
+    let rseq = resp.message.headers().get(&HeaderName::RSeq).unwrap();
+    assert_eq!(rseq.as_str().trim(), "1");
+
+    // UAC sends PRACK
+    let prack = RequestBuilder::new(SipMethod::Prack, &format!("sip:bob@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:alice@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:bob@{}>;tag={}", uas_addr, remote_tag))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "2 PRACK")
+        .header(HeaderName::RAck, "1 1 INVITE")
+        .build();
+    uac.send_to(&prack, uas_addr).await.unwrap();
+
+    // UAS receives PRACK
+    let prack_incoming = uas.recv().await.unwrap();
+    assert_eq!(*prack_incoming.message.method().unwrap(), SipMethod::Prack);
+
+    let rack = prack_incoming.message.headers().get(&HeaderName::RAck)
+        .expect("PRACK should have RAck header");
+    assert_eq!(rack.as_str(), "1 1 INVITE");
+
+    // UAS sends 200 OK to PRACK
+    if let SipMessage::Request(ref req) = prack_incoming.message {
+        let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+        uas.send_to(&ok, prack_incoming.source).await.unwrap();
+    }
+
+    let prack_resp = uac.recv().await.unwrap();
+    assert!(prack_resp.message.status().unwrap().is_success());
+}
+
+// =============================================================================
+// E2E Test: Opus codec encode/decode roundtrip
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_opus_codec_roundtrip() {
+    // Create two RTP sessions using Opus
+    let rtp_a_tmp = RtpSession::new(SessionConfig::new(
+        "127.0.0.1:0",
+        "127.0.0.1:19000".parse().unwrap(),
+        CodecType::Opus,
+    )).await.unwrap();
+    let a_addr = rtp_a_tmp.local_addr();
+    let rtp_b = RtpSession::new(SessionConfig::new(
+        "127.0.0.1:0",
+        a_addr,
+        CodecType::Opus,
+    )).await.unwrap();
+    drop(rtp_a_tmp);
+
+    // Rebind A to point to B's actual port
+    let mut rtp_a = RtpSession::new(SessionConfig::new(
+        "127.0.0.1:0",
+        rtp_b.local_addr(),
+        CodecType::Opus,
+    )).await.unwrap();
+
+    // Generate a 20ms Opus frame (960 samples at 48kHz)
+    let samples: Vec<i16> = (0..960)
+        .map(|i| ((i as f64 / 960.0 * std::f64::consts::TAU).sin() * 16000.0) as i16)
+        .collect();
+
+    // Encode and send
+    let bytes_sent = rtp_a.send_audio(&samples).await.unwrap();
+    assert!(bytes_sent > 0, "Opus encoding should produce non-empty payload");
+
+    // Verify codec properties
+    assert_eq!(CodecType::Opus.clock_rate(), 48000);
+    assert_eq!(CodecType::Opus.payload_type(), 111);
+    assert_eq!(CodecType::Opus.samples_per_frame(), 960);
+    assert_eq!(CodecType::Opus.name(), "opus");
+}
+
+// =============================================================================
+// E2E Test: SDP direction attributes in full call flow
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_sdp_direction_attributes() {
+    // Test that SDP direction attributes are correctly serialized/parsed
+    let directions = ["sendrecv", "sendonly", "recvonly", "inactive"];
+
+    for dir in &directions {
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media_directed(4000, dir);
+
+        // Serialize and parse back
+        let text = sdp.to_string();
+        assert!(text.contains(&format!("a={}", dir)),
+            "SDP should contain a={}, got:\n{}", dir, text);
+
+        let parsed = SdpSession::parse(&text).unwrap();
+        assert_eq!(parsed.get_audio_direction(), Some(*dir),
+            "Parsed direction should be {} for:\n{}", dir, text);
+        assert_eq!(parsed.get_audio_port(), Some(4000));
+    }
+}
+
+// =============================================================================
+// E2E Test: Incoming INVITE full flow (UAS side)
+// =============================================================================
+
+#[tokio::test]
+async fn e2e_incoming_invite_uas_flow() {
+    // Simulates an incoming call to a UAS and verifies the response flow
+    let uas = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uac = SipTransport::bind("127.0.0.1:0").await.unwrap();
+    let uas_addr = uas.local_addr();
+    let uac_addr = uac.local_addr();
+
+    let call_id = "incoming-test-call-id";
+    let local_tag = generate_tag();
+
+    // Build SDP for INVITE
+    let mut sdp = SdpSession::new("127.0.0.1");
+    sdp.add_audio_media(8000);
+    let sdp_body = sdp.to_string();
+
+    // UAC sends INVITE to UAS
+    let invite = RequestBuilder::new(SipMethod::Invite, &format!("sip:phone@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:caller@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:phone@{}>", uas_addr))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 INVITE")
+        .header(HeaderName::Contact, format!("<sip:caller@{}>", uac_addr))
+        .header(HeaderName::ContentType, "application/sdp")
+        .body(&sdp_body)
+        .build();
+    uac.send_to(&invite, uas_addr).await.unwrap();
+
+    // UAS receives INVITE
+    let incoming = uas.recv().await.unwrap();
+    assert_eq!(*incoming.message.method().unwrap(), SipMethod::Invite);
+    assert!(incoming.message.body().is_some());
+
+    // Parse SDP from INVITE
+    let invite_sdp = SdpSession::parse(incoming.message.body().unwrap()).unwrap();
+    assert_eq!(invite_sdp.get_audio_port(), Some(8000));
+
+    // UAS sends 180 Ringing
+    let uas_tag = generate_tag();
+    if let SipMessage::Request(ref req) = incoming.message {
+        let ringing = ResponseBuilder::from_request(req, StatusCode::RINGING)
+            .header(HeaderName::Contact, format!("<sip:phone@{}>", uas_addr))
+            .header(HeaderName::To, format!("<sip:phone@{}>;tag={}", uas_addr, uas_tag))
+            .build();
+        uas.send_to(&ringing, incoming.source).await.unwrap();
+    }
+
+    let ringing_resp = uac.recv().await.unwrap();
+    assert_eq!(ringing_resp.message.status().unwrap().0, 180);
+
+    // UAS sends 200 OK with SDP answer
+    let mut answer_sdp = SdpSession::new("127.0.0.1");
+    answer_sdp.add_audio_media(9000);
+    let answer_body = answer_sdp.to_string();
+
+    if let SipMessage::Request(ref req) = incoming.message {
+        let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+            .header(HeaderName::Contact, format!("<sip:phone@{}>", uas_addr))
+            .header(HeaderName::To, format!("<sip:phone@{}>;tag={}", uas_addr, uas_tag))
+            .header(HeaderName::ContentType, "application/sdp")
+            .body(&answer_body)
+            .build();
+        uas.send_to(&ok, incoming.source).await.unwrap();
+    }
+
+    let ok_resp = uac.recv().await.unwrap();
+    assert!(ok_resp.message.status().unwrap().is_success());
+    let ok_sdp = SdpSession::parse(ok_resp.message.body().unwrap()).unwrap();
+    assert_eq!(ok_sdp.get_audio_port(), Some(9000));
+
+    // UAC sends ACK
+    let ack = RequestBuilder::new(SipMethod::Ack, &format!("sip:phone@{}", uas_addr))
+        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={}", uac_addr, generate_branch()))
+        .header(HeaderName::From, format!("<sip:caller@example.com>;tag={}", local_tag))
+        .header(HeaderName::To, format!("<sip:phone@{}>;tag={}", uas_addr, uas_tag))
+        .header(HeaderName::CallId, call_id)
+        .header(HeaderName::CSeq, "1 ACK")
+        .build();
+    uac.send_to(&ack, uas_addr).await.unwrap();
+
+    let ack_incoming = uas.recv().await.unwrap();
+    assert_eq!(*ack_incoming.message.method().unwrap(), SipMethod::Ack);
 }

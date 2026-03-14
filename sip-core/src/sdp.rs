@@ -287,6 +287,31 @@ impl SdpSession {
         self.connection_address.as_deref()
     }
 
+    /// Create an audio media section with a specific direction attribute (for hold/resume).
+    pub fn add_audio_media_directed(&mut self, port: u16, direction: &str) -> &mut MediaDescription {
+        let mut media = MediaDescription::new_audio(port);
+        media.add_codec(0, "PCMU", 8000, None);
+        media.add_codec(8, "PCMA", 8000, None);
+        media.add_codec(101, "telephone-event", 8000, None);
+        media.add_attribute("fmtp", Some("101 0-15"));
+        media.add_codec(111, "opus", 48000, Some(2));
+        media.add_attribute(direction, None);
+        self.media_descriptions.push(media);
+        self.media_descriptions.last_mut().unwrap()
+    }
+
+    /// Get the media direction attribute (sendrecv, sendonly, recvonly, inactive).
+    pub fn get_audio_direction(&self) -> Option<&str> {
+        let audio = self.media_descriptions.iter().find(|m| m.media_type == MediaType::Audio)?;
+        for (name, _) in &audio.attributes {
+            match name.as_str() {
+                "sendrecv" | "sendonly" | "recvonly" | "inactive" => return Some(name.as_str()),
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn get_audio_dtmf_payload_type(&self) -> Option<u8> {
         let audio = self
             .media_descriptions
@@ -513,5 +538,61 @@ mod tests {
             channels: None,
         };
         assert_eq!(rtpmap.to_string(), "0 PCMU/8000");
+    }
+
+    #[test]
+    fn test_add_audio_media_directed_sendonly() {
+        let mut sdp = SdpSession::new("192.168.1.1");
+        sdp.add_audio_media_directed(4000, "sendonly");
+        let direction = sdp.get_audio_direction();
+        assert_eq!(direction, Some("sendonly"));
+        let s = sdp.to_string();
+        assert!(s.contains("a=sendonly"));
+        assert!(!s.contains("a=sendrecv"));
+    }
+
+    #[test]
+    fn test_add_audio_media_directed_recvonly() {
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media_directed(5000, "recvonly");
+        assert_eq!(sdp.get_audio_direction(), Some("recvonly"));
+    }
+
+    #[test]
+    fn test_add_audio_media_directed_inactive() {
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media_directed(5000, "inactive");
+        assert_eq!(sdp.get_audio_direction(), Some("inactive"));
+    }
+
+    #[test]
+    fn test_add_audio_media_directed_sendrecv() {
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media_directed(5000, "sendrecv");
+        assert_eq!(sdp.get_audio_direction(), Some("sendrecv"));
+    }
+
+    #[test]
+    fn test_get_audio_direction_default_is_none() {
+        // Standard add_audio_media uses sendrecv
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media(5000);
+        // sendrecv is added by add_audio_media
+        assert_eq!(sdp.get_audio_direction(), Some("sendrecv"));
+    }
+
+    #[test]
+    fn test_parse_sdp_with_direction() {
+        let sdp_text = "v=0\r\n\
+o=- 0 0 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=sendonly\r\n";
+        let sdp = SdpSession::parse(sdp_text).unwrap();
+        assert_eq!(sdp.get_audio_direction(), Some("sendonly"));
+        assert_eq!(sdp.get_audio_port(), Some(4000));
     }
 }

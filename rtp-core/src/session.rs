@@ -234,7 +234,7 @@ impl RtpSession {
     }
 
     /// Decode an RTP packet's payload to PCM samples
-    pub fn decode_packet(&self, packet: &RtpPacket) -> Result<Vec<i16>, SessionError> {
+    pub fn decode_packet(&mut self, packet: &RtpPacket) -> Result<Vec<i16>, SessionError> {
         Ok(self.codec.decode(&packet.payload)?)
     }
 
@@ -259,7 +259,7 @@ impl RtpSession {
         let expected_source = self.config.remote_addr;
 
         tokio::spawn(async move {
-            let codec = CodecPipeline::new(codec_type);
+            let mut codec = CodecPipeline::new(codec_type);
             let mut jitter = JitterBuffer::new(jitter_size);
             let mut buf = vec![0u8; 65535];
 
@@ -336,7 +336,7 @@ impl RtpSession {
         let expected_source = self.config.remote_addr;
 
         tokio::spawn(async move {
-            let codec = CodecPipeline::new(codec_type);
+            let mut codec = CodecPipeline::new(codec_type);
             let mut jitter = JitterBuffer::new(jitter_size);
             let mut buf = vec![0u8; 65535];
 
@@ -510,7 +510,7 @@ mod tests {
 
         // Create receiver first to get its address
         let recv_config = SessionConfig::new("127.0.0.1:0", remote_addr, CodecType::Pcmu);
-        let recv_session = RtpSession::new(recv_config).await.unwrap();
+        let mut recv_session = RtpSession::new(recv_config).await.unwrap();
         let recv_addr = recv_session.local_addr();
 
         // Create sender pointed at receiver

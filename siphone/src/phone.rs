@@ -1,6 +1,7 @@
 use crate::sip_debug::SipDebugger;
 use rtp_core::audio_device::{AudioConfig, DeviceSelector};
 use rtp_core::{AudioRecorder, CodecType, ReceiveEvent, RtpSession, SessionConfig};
+use sip_core::auth::{self, Credentials};
 use sip_core::header::{generate_branch, generate_tag, HeaderName};
 use sip_core::message::{RequestBuilder, ResponseBuilder, SipMessage, SipMethod, StatusCode};
 use sip_core::sdp::SdpSession;
@@ -50,6 +51,12 @@ pub struct SoftPhone {
     local_dtmf_payload_type: u8,
     dtmf_queue: VecDeque<QueuedDtmf>,
     last_announced_rfc2833: Option<(char, u32)>,
+    credentials: Option<Credentials>,
+    on_hold: bool,
+    /// Stored server host for re-registration after auth challenge.
+    server_host: Option<String>,
+    /// Stored user for re-registration after auth challenge.
+    reg_user: Option<String>,
 }
 
 impl SoftPhone {
@@ -73,18 +80,33 @@ impl SoftPhone {
             local_dtmf_payload_type: 101,
             dtmf_queue: VecDeque::new(),
             last_announced_rfc2833: None,
+            credentials: None,
+            on_hold: false,
+            server_host: None,
+            reg_user: None,
         })
+    }
+
+    /// Set credentials for digest authentication.
+    pub fn set_credentials(&mut self, username: &str, password: &str) {
+        self.credentials = Some(Credentials {
+            username: username.to_string(),
+            password: password.to_string(),
+        });
     }
 
     pub async fn register(
         &mut self,
         server: &str,
         user: &str,
-        _password: &str,
+        password: &str,
     ) -> Result<(), PhoneError> {
+        self.set_credentials(user, password);
+        self.server_host = Some(server.to_string());
+        self.reg_user = Some(user.to_string());
+
         let call_id = Uuid::new_v4().to_string();
-        let branch = generate_branch();
-        let local_addr = self.transport.local_addr();
+        let server_addr = resolve_server_addr(server)?;
 
         let server_uri = if server.starts_with("sip:") {
             server.to_string()
@@ -92,39 +114,110 @@ impl SoftPhone {
             format!("sip:{}", server)
         };
 
-        let request = RequestBuilder::new(SipMethod::Register, &server_uri)
-            .header(
-                HeaderName::Via,
-                format!(
-                    "SIP/2.0/UDP {};branch={};rport",
-                    local_addr, branch
-                ),
-            )
-            .header(HeaderName::MaxForwards, "70")
-            .header(
-                HeaderName::From,
-                format!("<sip:{}@{}>;tag={}", user, server, self.local_tag),
-            )
-            .header(
-                HeaderName::To,
-                format!("<sip:{}@{}>", user, server),
-            )
-            .header(HeaderName::CallId, &call_id)
-            .header(HeaderName::CSeq, "1 REGISTER")
-            .header(
-                HeaderName::Contact,
-                format!("<sip:{}@{}>", user, local_addr),
-            )
-            .header(HeaderName::Expires, "3600")
-            .header(HeaderName::UserAgent, "siphone/0.1.0")
-            .build();
-
-        // Resolve server address
-        let server_addr = resolve_server_addr(server)?;
+        // Send initial REGISTER (without auth)
+        let request = self.build_register(&server_uri, user, server, &call_id, 1, None);
         self.transport.send_to(&request, server_addr).await?;
-        self.call_id = Some(call_id);
 
+        // Wait for response - handle 401/407 challenge
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.transport.recv(),
+        ).await
+            .map_err(|_| PhoneError::CallFailed("Registration timed out".into()))?
+            .map_err(PhoneError::Transport)?;
+
+        if let Some(status) = resp.message.status() {
+            if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::PROXY_AUTH_REQUIRED {
+                // Extract challenge
+                let auth_header = if *status == StatusCode::UNAUTHORIZED {
+                    resp.message.headers().get(&HeaderName::WwwAuthenticate)
+                } else {
+                    resp.message.headers().get(&HeaderName::ProxyAuthenticate)
+                };
+
+                if let Some(header_val) = auth_header {
+                    if let Some(challenge) = auth::parse_challenge(header_val.as_str()) {
+                        let digest = auth::compute_digest(
+                            &challenge,
+                            self.credentials.as_ref().unwrap(),
+                            "REGISTER",
+                            &server_uri,
+                        );
+
+                        let auth_name = if *status == StatusCode::UNAUTHORIZED {
+                            HeaderName::Authorization
+                        } else {
+                            HeaderName::ProxyAuthorization
+                        };
+
+                        let request = self.build_register(
+                            &server_uri, user, server, &call_id, 2,
+                            Some((auth_name, digest.to_string())),
+                        );
+                        self.transport.send_to(&request, server_addr).await?;
+
+                        // Wait for final response
+                        let resp2 = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            self.transport.recv(),
+                        ).await
+                            .map_err(|_| PhoneError::CallFailed("Registration auth timed out".into()))?
+                            .map_err(PhoneError::Transport)?;
+
+                        if let Some(s) = resp2.message.status() {
+                            if s.is_success() {
+                                self.call_id = Some(call_id);
+                                return Ok(());
+                            } else {
+                                return Err(PhoneError::CallFailed(format!(
+                                    "Registration failed: {} {}", s, s.reason_phrase()
+                                )));
+                            }
+                        }
+                    }
+                }
+                return Err(PhoneError::CallFailed("Auth challenge parse failed".into()));
+            } else if status.is_success() {
+                self.call_id = Some(call_id);
+                return Ok(());
+            } else {
+                return Err(PhoneError::CallFailed(format!(
+                    "Registration failed: {} {}", status, status.reason_phrase()
+                )));
+            }
+        }
+
+        self.call_id = Some(call_id);
         Ok(())
+    }
+
+    fn build_register(
+        &self,
+        server_uri: &str,
+        user: &str,
+        server: &str,
+        call_id: &str,
+        cseq: u32,
+        auth_header: Option<(HeaderName, String)>,
+    ) -> SipMessage {
+        let branch = generate_branch();
+        let local_addr = self.transport.local_addr();
+        let mut builder = RequestBuilder::new(SipMethod::Register, server_uri)
+            .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, branch))
+            .header(HeaderName::MaxForwards, "70")
+            .header(HeaderName::From, format!("<sip:{}@{}>;tag={}", user, server, self.local_tag))
+            .header(HeaderName::To, format!("<sip:{}@{}>", user, server))
+            .header(HeaderName::CallId, call_id)
+            .header(HeaderName::CSeq, format!("{} REGISTER", cseq))
+            .header(HeaderName::Contact, format!("<sip:{}@{}>", user, local_addr))
+            .header(HeaderName::Expires, "3600")
+            .header(HeaderName::UserAgent, "siphone/0.1.0");
+
+        if let Some((name, value)) = auth_header {
+            builder = builder.header(name, value);
+        }
+
+        builder.build()
     }
 
     pub async fn call(
@@ -212,6 +305,8 @@ impl SoftPhone {
         self.dialog = Some(dialog);
         self.rtp_session = Some(rtp_session);
         self.call_id = Some(call_id);
+        self.server_host = Some(server_host);
+        self.on_hold = false;
 
         Ok(())
     }
@@ -398,6 +493,36 @@ impl SoftPhone {
                                 if status.is_provisional() {
                                     println!("Call progress: {} {}", status, status.reason_phrase());
 
+                                    // Handle PRACK: if response has Require: 100rel and RSeq, send PRACK
+                                    if let Some(require) = msg.headers().get(&HeaderName::Require) {
+                                        if require.as_str().contains("100rel") {
+                                            if let Some(rseq_val) = msg.headers().get(&HeaderName::RSeq) {
+                                                if let Ok(rseq) = rseq_val.as_str().trim().parse::<u32>() {
+                                                    let cseq_info = msg.cseq();
+                                                    let (cseq_num, cseq_method) = cseq_info
+                                                        .map(|(n, m)| (n, m.to_string()))
+                                                        .unwrap_or((1, "INVITE".to_string()));
+                                                    let prack_cseq = dialog.next_cseq();
+                                                    let prack = RequestBuilder::new(SipMethod::Prack, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
+                                                        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()))
+                                                        .header(HeaderName::MaxForwards, "70")
+                                                        .header(HeaderName::From, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                                                        .header(HeaderName::To, format!("<{}>{}", dialog.remote_uri, dialog.remote_tag.as_ref().map(|t| format!(";tag={}", t)).unwrap_or_default()))
+                                                        .header(HeaderName::CallId, &dialog.call_id)
+                                                        .header(HeaderName::CSeq, format!("{} PRACK", prack_cseq))
+                                                        .header(HeaderName::RAck, format!("{} {} {}", rseq, cseq_num, cseq_method))
+                                                        .header(HeaderName::UserAgent, "siphone/0.1.0")
+                                                        .build();
+                                                    if let Err(e) = self.transport.send_to(&prack, incoming.source).await {
+                                                        println!("Failed to send PRACK: {}", e);
+                                                    } else {
+                                                        println!("PRACK sent for RSeq {}", rseq);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // 183 Session Progress with SDP = early media
                                     if status.0 == 183 {
                                         if let Some(body) = msg.body() {
@@ -489,6 +614,83 @@ impl SoftPhone {
                                     debugger.capture_outgoing(&ok, local_addr, incoming.source);
                                     self.transport.send_to(&ok, incoming.source).await?;
                                 }
+                            } else if *method == SipMethod::Invite {
+                                // re-INVITE (hold/resume from remote)
+                                println!("Re-INVITE received");
+                                if let Some(body) = msg.body() {
+                                    if let Ok(sdp) = SdpSession::parse(body) {
+                                        match sdp.get_audio_direction() {
+                                            Some("sendonly") => {
+                                                println!("Remote put call on hold");
+                                                self.on_hold = true;
+                                            }
+                                            Some("inactive") => {
+                                                println!("Remote put call on hold (inactive)");
+                                                self.on_hold = true;
+                                            }
+                                            _ => {
+                                                if self.on_hold {
+                                                    println!("Remote resumed call");
+                                                    self.on_hold = false;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Send 200 OK with our SDP
+                                if let SipMessage::Request(ref req) = msg {
+                                    let rtp_port = self.rtp_session.as_ref().map(|r| r.local_addr().port()).unwrap_or(0);
+                                    let mut sdp = SdpSession::new(&self.local_ip);
+                                    sdp.add_audio_media(rtp_port);
+                                    let sdp_body = sdp.to_string();
+                                    let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+                                        .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                                        .header(HeaderName::ContentType, "application/sdp")
+                                        .body(&sdp_body)
+                                        .build();
+                                    debugger.capture_outgoing(&ok, local_addr, incoming.source);
+                                    self.transport.send_to(&ok, incoming.source).await?;
+                                }
+                            } else if *method == SipMethod::Refer {
+                                // Incoming REFER (transfer request)
+                                if let Some(refer_to) = msg.headers().get(&HeaderName::ReferTo) {
+                                    println!("Transfer requested to: {}", refer_to.as_str());
+                                    // Accept the REFER
+                                    if let SipMessage::Request(ref req) = msg {
+                                        let accepted = ResponseBuilder::from_request(req, StatusCode::ACCEPTED).build();
+                                        debugger.capture_outgoing(&accepted, local_addr, incoming.source);
+                                        self.transport.send_to(&accepted, incoming.source).await?;
+                                    }
+                                    // Send NOTIFY with 200 OK (sipfrag)
+                                    let notify_cseq = dialog.next_cseq();
+                                    let notify = RequestBuilder::new(SipMethod::Notify, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
+                                        .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()))
+                                        .header(HeaderName::MaxForwards, "70")
+                                        .header(HeaderName::From, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                                        .header(HeaderName::To, format!("<{}>{}", dialog.remote_uri, dialog.remote_tag.as_ref().map(|t| format!(";tag={}", t)).unwrap_or_default()))
+                                        .header(HeaderName::CallId, &dialog.call_id)
+                                        .header(HeaderName::CSeq, format!("{} NOTIFY", notify_cseq))
+                                        .header(HeaderName::Event, "refer")
+                                        .header(HeaderName::SubscriptionState, "terminated;reason=noresource")
+                                        .header(HeaderName::ContentType, "message/sipfrag")
+                                        .body("SIP/2.0 200 OK")
+                                        .build();
+                                    self.transport.send_to(&notify, incoming.source).await?;
+                                } else {
+                                    if let SipMessage::Request(ref req) = msg {
+                                        let bad = ResponseBuilder::from_request(req, StatusCode::BAD_REQUEST).build();
+                                        self.transport.send_to(&bad, incoming.source).await?;
+                                    }
+                                }
+                            } else if *method == SipMethod::Notify {
+                                // NOTIFY for REFER status
+                                if let Some(body) = msg.body() {
+                                    println!("NOTIFY: {}", body.trim());
+                                }
+                                if let SipMessage::Request(ref req) = msg {
+                                    let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                                    self.transport.send_to(&ok, incoming.source).await?;
+                                }
                             }
                         }
 
@@ -521,6 +723,9 @@ impl SoftPhone {
                                     println!("  dtmf-info <digits> Queue DTMF over SIP INFO");
                                     println!("  dtmf-send          Send queued DTMF digits now");
                                     println!("  dtmf-queue         Show queued DTMF digits count");
+                                    println!("  hold               Put call on hold");
+                                    println!("  resume             Resume held call");
+                                    println!("  transfer <uri>     Blind transfer call (REFER)");
                                     println!("  hangup | bye       End the call");
                                     println!("  help               Show this help");
                                 }
@@ -632,6 +837,36 @@ impl SoftPhone {
                                 }
                                 "dtmf-queue" => {
                                     println!("Queued DTMF digits: {}", self.dtmf_queue.len());
+                                }
+                                "hold" => {
+                                    if self.on_hold {
+                                        println!("Already on hold.");
+                                    } else {
+                                        match self.hold().await {
+                                            Ok(_) => println!("Call on hold (re-INVITE sent with a=sendonly)"),
+                                            Err(e) => println!("Hold failed: {}", e),
+                                        }
+                                    }
+                                }
+                                "resume" | "unhold" => {
+                                    if !self.on_hold {
+                                        println!("Call is not on hold.");
+                                    } else {
+                                        match self.resume().await {
+                                            Ok(_) => println!("Call resumed (re-INVITE sent with a=sendrecv)"),
+                                            Err(e) => println!("Resume failed: {}", e),
+                                        }
+                                    }
+                                }
+                                "transfer" | "xfer" | "refer" => {
+                                    if parts.len() < 2 {
+                                        println!("Usage: transfer <sip:user@host>");
+                                    } else {
+                                        match self.transfer(parts[1]).await {
+                                            Ok(_) => println!("REFER sent to transfer call to {}", parts[1]),
+                                            Err(e) => println!("Transfer failed: {}", e),
+                                        }
+                                    }
                                 }
                                 "hangup" | "bye" | "quit" | "exit" | "q" => {
                                     println!("Hanging up...");
@@ -832,6 +1067,216 @@ impl SoftPhone {
         Some((path, rec))
     }
 
+    /// Put the current call on hold by sending a re-INVITE with a=sendonly.
+    pub async fn hold(&mut self) -> Result<(), PhoneError> {
+        let dialog = self.dialog.as_mut().ok_or(PhoneError::NoDialog)?;
+        let local_addr = self.transport.local_addr();
+        let cseq = dialog.next_cseq();
+
+        let rtp_port = self.rtp_session.as_ref().map(|r| r.local_addr().port()).unwrap_or(0);
+        let mut sdp = SdpSession::new(&self.local_ip);
+        sdp.add_audio_media_directed(rtp_port, "sendonly");
+        let sdp_body = sdp.to_string();
+
+        let reinvite = RequestBuilder::new(SipMethod::Invite, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
+            .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()))
+            .header(HeaderName::MaxForwards, "70")
+            .header(HeaderName::From, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+            .header(HeaderName::To, format!("<{}>{}", dialog.remote_uri, dialog.remote_tag.as_ref().map(|t| format!(";tag={}", t)).unwrap_or_default()))
+            .header(HeaderName::CallId, &dialog.call_id)
+            .header(HeaderName::CSeq, format!("{} INVITE", cseq))
+            .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+            .header(HeaderName::ContentType, "application/sdp")
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .body(&sdp_body)
+            .build();
+
+        let dest = dialog.remote_target.as_deref()
+            .and_then(sip_core::transport::resolve_sip_uri)
+            .or(self.remote_sip_addr);
+        if let Some(addr) = dest {
+            self.transport.send_to(&reinvite, addr).await?;
+        }
+        self.on_hold = true;
+        Ok(())
+    }
+
+    /// Resume a held call by sending a re-INVITE with a=sendrecv.
+    pub async fn resume(&mut self) -> Result<(), PhoneError> {
+        let dialog = self.dialog.as_mut().ok_or(PhoneError::NoDialog)?;
+        let local_addr = self.transport.local_addr();
+        let cseq = dialog.next_cseq();
+
+        let rtp_port = self.rtp_session.as_ref().map(|r| r.local_addr().port()).unwrap_or(0);
+        let mut sdp = SdpSession::new(&self.local_ip);
+        sdp.add_audio_media_directed(rtp_port, "sendrecv");
+        let sdp_body = sdp.to_string();
+
+        let reinvite = RequestBuilder::new(SipMethod::Invite, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
+            .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()))
+            .header(HeaderName::MaxForwards, "70")
+            .header(HeaderName::From, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+            .header(HeaderName::To, format!("<{}>{}", dialog.remote_uri, dialog.remote_tag.as_ref().map(|t| format!(";tag={}", t)).unwrap_or_default()))
+            .header(HeaderName::CallId, &dialog.call_id)
+            .header(HeaderName::CSeq, format!("{} INVITE", cseq))
+            .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+            .header(HeaderName::ContentType, "application/sdp")
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .body(&sdp_body)
+            .build();
+
+        let dest = dialog.remote_target.as_deref()
+            .and_then(sip_core::transport::resolve_sip_uri)
+            .or(self.remote_sip_addr);
+        if let Some(addr) = dest {
+            self.transport.send_to(&reinvite, addr).await?;
+        }
+        self.on_hold = false;
+        Ok(())
+    }
+
+    /// Send a REFER request for blind call transfer (RFC 3515).
+    pub async fn transfer(&mut self, target_uri: &str) -> Result<(), PhoneError> {
+        let dialog = self.dialog.as_mut().ok_or(PhoneError::NoDialog)?;
+        let local_addr = self.transport.local_addr();
+        let cseq = dialog.next_cseq();
+
+        let refer_to = if target_uri.starts_with("sip:") {
+            target_uri.to_string()
+        } else {
+            format!("sip:{}", target_uri)
+        };
+
+        let refer = RequestBuilder::new(SipMethod::Refer, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
+            .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()))
+            .header(HeaderName::MaxForwards, "70")
+            .header(HeaderName::From, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+            .header(HeaderName::To, format!("<{}>{}", dialog.remote_uri, dialog.remote_tag.as_ref().map(|t| format!(";tag={}", t)).unwrap_or_default()))
+            .header(HeaderName::CallId, &dialog.call_id)
+            .header(HeaderName::CSeq, format!("{} REFER", cseq))
+            .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+            .header(HeaderName::ReferTo, &refer_to)
+            .header(HeaderName::ReferredBy, format!("<{}>", dialog.local_uri))
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .build();
+
+        let dest = dialog.remote_target.as_deref()
+            .and_then(sip_core::transport::resolve_sip_uri)
+            .or(self.remote_sip_addr);
+        if let Some(addr) = dest {
+            self.transport.send_to(&refer, addr).await?;
+        }
+        Ok(())
+    }
+
+    /// Send a PRACK for a reliable provisional response (RFC 3262).
+    pub async fn send_prack(
+        &mut self,
+        rseq: u32,
+        cseq_num: u32,
+        cseq_method: &str,
+        dest: SocketAddr,
+    ) -> Result<(), PhoneError> {
+        let dialog = self.dialog.as_mut().ok_or(PhoneError::NoDialog)?;
+        let local_addr = self.transport.local_addr();
+        let prack_cseq = dialog.next_cseq();
+
+        let prack = RequestBuilder::new(SipMethod::Prack, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
+            .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()))
+            .header(HeaderName::MaxForwards, "70")
+            .header(HeaderName::From, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+            .header(HeaderName::To, format!("<{}>{}", dialog.remote_uri, dialog.remote_tag.as_ref().map(|t| format!(";tag={}", t)).unwrap_or_default()))
+            .header(HeaderName::CallId, &dialog.call_id)
+            .header(HeaderName::CSeq, format!("{} PRACK", prack_cseq))
+            .header(HeaderName::RAck, format!("{} {} {}", rseq, cseq_num, cseq_method))
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .build();
+
+        self.transport.send_to(&prack, dest).await?;
+        Ok(())
+    }
+
+    /// Listen for an incoming INVITE and accept it. Returns when a call arrives.
+    pub async fn accept_call(
+        &mut self,
+        timeout_secs: u64,
+    ) -> Result<(), PhoneError> {
+        let local_addr = self.transport.local_addr();
+
+        let incoming = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.wait_for_invite(),
+        ).await
+            .map_err(|_| PhoneError::CallFailed("No incoming call within timeout".into()))?
+            .map_err(|e| PhoneError::CallFailed(format!("Error waiting for call: {}", e)))?;
+
+        let (invite_msg, source) = incoming;
+
+        // Create dialog from incoming INVITE
+        let dialog = SipDialog::from_invite(&invite_msg)
+            .ok_or_else(|| PhoneError::CallFailed("Failed to create dialog from INVITE".into()))?;
+
+        // Send 180 Ringing
+        if let SipMessage::Request(ref req) = invite_msg {
+            let ringing = ResponseBuilder::from_request(req, StatusCode::RINGING)
+                .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                .build();
+            self.transport.send_to(&ringing, source).await?;
+        }
+
+        // Parse SDP from INVITE to get remote RTP address
+        let mut remote_rtp_addr = None;
+        if let Some(body) = invite_msg.body() {
+            if let Some((addr, dtmf_pt)) = parse_sdp_rtp_addr(body) {
+                remote_rtp_addr = Some(addr);
+                self.remote_dtmf_payload_type = dtmf_pt;
+            }
+        }
+
+        // Create RTP session
+        let rtp_remote = remote_rtp_addr.unwrap_or_else(|| SocketAddr::new(source.ip(), 0));
+        let rtp_config = SessionConfig::new("0.0.0.0:0", rtp_remote, CodecType::Pcmu);
+        let rtp_session = RtpSession::new(rtp_config).await?;
+        let rtp_port = rtp_session.local_addr().port();
+
+        // Build SDP answer
+        let mut sdp = SdpSession::new(&self.local_ip);
+        sdp.add_audio_media(rtp_port);
+        let sdp_body = sdp.to_string();
+
+        // Send 200 OK with SDP answer
+        if let SipMessage::Request(ref req) = invite_msg {
+            let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+                .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                .header(HeaderName::ContentType, "application/sdp")
+                .header(HeaderName::UserAgent, "siphone/0.1.0")
+                .body(&sdp_body)
+                .build();
+            self.transport.send_to(&ok, source).await?;
+        }
+
+        self.dialog = Some(dialog);
+        self.rtp_session = Some(rtp_session);
+        self.remote_sip_addr = Some(source);
+        self.on_hold = false;
+
+        Ok(())
+    }
+
+    /// Wait for an incoming INVITE request.
+    async fn wait_for_invite(&self) -> Result<(SipMessage, SocketAddr), PhoneError> {
+        loop {
+            let incoming = self.transport.recv().await?;
+            if let Some(method) = incoming.message.method() {
+                if *method == SipMethod::Invite {
+                    return Ok((incoming.message, incoming.source));
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn dialog(&self) -> Option<&SipDialog> {
         self.dialog.as_ref()
@@ -840,6 +1285,11 @@ impl SoftPhone {
     #[cfg(test)]
     pub fn local_addr(&self) -> SocketAddr {
         self.transport.local_addr()
+    }
+
+    #[cfg(test)]
+    pub fn is_on_hold(&self) -> bool {
+        self.on_hold
     }
 }
 
@@ -944,12 +1394,26 @@ fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
         return Ok(SocketAddr::new(ip, 5060));
     }
 
-    // Try DNS resolution
-    use std::net::ToSocketAddrs;
-    let addr_with_port = if addr_str.contains(':') {
-        addr_str.to_string()
+    // Extract hostname and port for DNS resolution
+    let (hostname, explicit_port) = if let Some((h, p)) = addr_str.rsplit_once(':') {
+        (h, p.parse::<u16>().ok())
     } else {
-        format!("{}:5060", addr_str)
+        (addr_str, None)
+    };
+
+    // Try SRV lookup: _sip._udp.<hostname>
+    if explicit_port.is_none() {
+        if let Some(addr) = resolve_srv(hostname) {
+            return Ok(addr);
+        }
+    }
+
+    // Fall back to standard DNS A/AAAA resolution
+    use std::net::ToSocketAddrs;
+    let addr_with_port = if let Some(port) = explicit_port {
+        format!("{}:{}", hostname, port)
+    } else {
+        format!("{}:5060", hostname)
     };
     if let Ok(mut addrs) = addr_with_port.to_socket_addrs() {
         if let Some(addr) = addrs.next() {
@@ -961,6 +1425,41 @@ fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
         "Cannot resolve server address: {}",
         server
     )))
+}
+
+/// Try DNS SRV resolution for _sip._udp.<hostname>
+fn resolve_srv(hostname: &str) -> Option<SocketAddr> {
+    use hickory_resolver::Resolver;
+    use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+
+    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).ok()?;
+    let srv_name = format!("_sip._udp.{}", hostname);
+
+    let lookup = resolver.srv_lookup(&srv_name).ok()?;
+
+    // Sort by priority (lower = better), then by weight
+    let mut records: Vec<_> = lookup.iter().collect();
+    records.sort_by(|a, b| {
+        a.priority().cmp(&b.priority())
+            .then_with(|| b.weight().cmp(&a.weight()))
+    });
+
+    for record in records {
+        let target = record.target().to_string();
+        let target = target.trim_end_matches('.');
+        let port = record.port();
+
+        // Resolve the SRV target to an IP
+        use std::net::ToSocketAddrs;
+        let addr_str = format!("{}:{}", target, port);
+        if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                return Some(addr);
+            }
+        }
+    }
+
+    None
 }
 
 fn is_valid_dtmf_digit(ch: char) -> bool {
@@ -1019,6 +1518,16 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_server_addr_ip_passthrough() {
+        // IP addresses should bypass SRV lookup
+        let addr = resolve_server_addr("192.168.1.1:5060").unwrap();
+        assert_eq!(addr.to_string(), "192.168.1.1:5060");
+
+        let addr = resolve_server_addr("192.168.1.1").unwrap();
+        assert_eq!(addr.port(), 5060);
+    }
+
+    #[test]
     fn test_extract_host_from_uri() {
         assert_eq!(extract_host_from_uri("sip:bob@example.com"), Some("example.com".into()));
         assert_eq!(extract_host_from_uri("sip:2234@135.125.159.46"), Some("135.125.159.46".into()));
@@ -1072,28 +1581,41 @@ mod tests {
     #[tokio::test]
     async fn test_softphone_register() {
         let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let _phone_addr = phone.local_addr();
 
-        // Create a mock server to receive the REGISTER
+        // Create a mock server to receive the REGISTER and respond 200 OK
         let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
+
+        // Spawn mock server that replies 200 OK to any REGISTER
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            let (len, source) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_socket.recv_from(&mut buf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+            assert!(msg.is_request());
+            if let SipMessage::Request(ref req) = msg {
+                assert_eq!(req.method, SipMethod::Register);
+                // Send 200 OK response
+                let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                server_socket.send_to(ok.to_string().as_bytes(), source).await.unwrap();
+            }
+            msg
+        });
 
         phone
             .register(&server_addr.to_string(), "alice", "secret")
             .await
             .unwrap();
 
-        // Verify the server received a REGISTER
-        let mut buf = vec![0u8; 65535];
-        let (len, _source) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server_socket.recv_from(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
-        assert!(msg.is_request());
+        // Verify server received a valid REGISTER
+        let msg = server_handle.await.unwrap();
         if let SipMessage::Request(req) = &msg {
             assert_eq!(req.method, SipMethod::Register);
         }
@@ -1337,5 +1859,474 @@ Content-Length: 0\r\n\
         );
         // The actual guard in run_call is: if rtp_event_rx.is_none() { start_receiving_events }
         // Since rtp_event_rx is Some, no duplicate receiver would be created.
+    }
+
+    // ── Digest Authentication Tests ──────────────────────────
+
+    #[tokio::test]
+    async fn test_register_with_401_challenge() {
+        // Test that register() handles a 401 challenge by re-sending with Authorization
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let _phone_addr = phone.local_addr();
+
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+
+            // Receive initial REGISTER (no auth)
+            let (len, source) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_socket.recv_from(&mut buf),
+            ).await.unwrap().unwrap();
+
+            let msg1 = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+            assert!(msg1.is_request());
+            // Should NOT have Authorization header yet
+            assert!(msg1.headers().get(&HeaderName::Authorization).is_none());
+
+            // Send 401 Unauthorized with challenge
+            if let SipMessage::Request(ref req) = msg1 {
+                let challenge_resp = ResponseBuilder::from_request(req, StatusCode::UNAUTHORIZED)
+                    .header(HeaderName::WwwAuthenticate,
+                        r#"Digest realm="testrealm", nonce="abc123", algorithm=MD5"#)
+                    .build();
+                server_socket.send_to(challenge_resp.to_string().as_bytes(), source).await.unwrap();
+            }
+
+            // Receive second REGISTER (with auth)
+            let (len2, source2) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_socket.recv_from(&mut buf),
+            ).await.unwrap().unwrap();
+
+            let msg2 = SipMessage::parse(&String::from_utf8_lossy(&buf[..len2])).unwrap();
+            assert!(msg2.is_request());
+            // Should now have Authorization header
+            let auth = msg2.headers().get(&HeaderName::Authorization)
+                .expect("Second REGISTER should have Authorization header");
+            let auth_str = auth.as_str();
+            assert!(auth_str.starts_with("Digest "), "Auth header should start with 'Digest '");
+            assert!(auth_str.contains("username=\"alice\""));
+            assert!(auth_str.contains("realm=\"testrealm\""));
+            assert!(auth_str.contains("nonce=\"abc123\""));
+
+            // Send 200 OK
+            if let SipMessage::Request(ref req) = msg2 {
+                let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                server_socket.send_to(ok.to_string().as_bytes(), source2).await.unwrap();
+            }
+        });
+
+        phone.register(&server_addr.to_string(), "alice", "secret").await.unwrap();
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_register_with_407_proxy_auth() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+
+            let (len, source) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_socket.recv_from(&mut buf),
+            ).await.unwrap().unwrap();
+
+            let msg1 = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+
+            // Send 407 Proxy Authentication Required
+            if let SipMessage::Request(ref req) = msg1 {
+                let resp = ResponseBuilder::from_request(req, StatusCode::PROXY_AUTH_REQUIRED)
+                    .header(HeaderName::ProxyAuthenticate,
+                        r#"Digest realm="proxy.example.com", nonce="xyz789""#)
+                    .build();
+                server_socket.send_to(resp.to_string().as_bytes(), source).await.unwrap();
+            }
+
+            // Receive second REGISTER with Proxy-Authorization
+            let (len2, source2) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_socket.recv_from(&mut buf),
+            ).await.unwrap().unwrap();
+
+            let msg2 = SipMessage::parse(&String::from_utf8_lossy(&buf[..len2])).unwrap();
+            let proxy_auth = msg2.headers().get(&HeaderName::ProxyAuthorization)
+                .expect("Should have Proxy-Authorization header");
+            assert!(proxy_auth.as_str().contains("realm=\"proxy.example.com\""));
+
+            if let SipMessage::Request(ref req) = msg2 {
+                let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                server_socket.send_to(ok.to_string().as_bytes(), source2).await.unwrap();
+            }
+        });
+
+        phone.register(&server_addr.to_string(), "bob", "pass123").await.unwrap();
+        server_handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_set_credentials() {
+        // Use a synchronous test for credential storage
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+            assert!(phone.credentials.is_none());
+            phone.set_credentials("alice", "secret");
+            assert!(phone.credentials.is_some());
+            let creds = phone.credentials.as_ref().unwrap();
+            assert_eq!(creds.username, "alice");
+            assert_eq!(creds.password, "secret");
+        });
+    }
+
+    // ── Hold/Resume Tests ──────────────────────────
+
+    #[tokio::test]
+    async fn test_hold_sends_reinvite_sendonly() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        // Establish a call first
+        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+
+        // Drain the INVITE from server
+        let mut buf = vec![0u8; 65535];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        // Set remote_sip_addr so hold() knows where to send
+        phone.remote_sip_addr = Some(server_addr);
+
+        assert!(!phone.is_on_hold());
+
+        // Call hold()
+        phone.hold().await.unwrap();
+        assert!(phone.is_on_hold());
+
+        // Verify server received a re-INVITE with a=sendonly
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+        if let SipMessage::Request(req) = &msg {
+            assert_eq!(req.method, SipMethod::Invite);
+            let sdp = SdpSession::parse(req.body.as_ref().unwrap()).unwrap();
+            assert_eq!(sdp.get_audio_direction(), Some("sendonly"));
+        } else {
+            panic!("Expected INVITE request for hold");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resume_sends_reinvite_sendrecv() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        phone.remote_sip_addr = Some(server_addr);
+        phone.on_hold = true; // Simulate already on hold
+
+        phone.resume().await.unwrap();
+        assert!(!phone.is_on_hold());
+
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+        if let SipMessage::Request(req) = &msg {
+            assert_eq!(req.method, SipMethod::Invite);
+            let sdp = SdpSession::parse(req.body.as_ref().unwrap()).unwrap();
+            assert_eq!(sdp.get_audio_direction(), Some("sendrecv"));
+        } else {
+            panic!("Expected INVITE request for resume");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hold_without_dialog_fails() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let result = phone.hold().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resume_without_dialog_fails() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let result = phone.resume().await;
+        assert!(result.is_err());
+    }
+
+    // ── Transfer (REFER) Tests ──────────────────────────
+
+    #[tokio::test]
+    async fn test_transfer_sends_refer() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        phone.remote_sip_addr = Some(server_addr);
+
+        phone.transfer("sip:carol@example.com").await.unwrap();
+
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+        if let SipMessage::Request(req) = &msg {
+            assert_eq!(req.method, SipMethod::Refer);
+            let refer_to = msg.headers().get(&HeaderName::ReferTo)
+                .expect("REFER should have Refer-To header");
+            assert_eq!(refer_to.as_str(), "sip:carol@example.com");
+            let referred_by = msg.headers().get(&HeaderName::ReferredBy)
+                .expect("REFER should have Referred-By header");
+            assert!(referred_by.as_str().contains("alice"));
+        } else {
+            panic!("Expected REFER request");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transfer_auto_adds_sip_prefix() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        phone.remote_sip_addr = Some(server_addr);
+
+        // Transfer without sip: prefix - should be added automatically
+        phone.transfer("carol@example.com").await.unwrap();
+
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+        let refer_to = msg.headers().get(&HeaderName::ReferTo).unwrap();
+        assert_eq!(refer_to.as_str(), "sip:carol@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_transfer_without_dialog_fails() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let result = phone.transfer("sip:carol@example.com").await;
+        assert!(result.is_err());
+    }
+
+    // ── PRACK Tests ──────────────────────────
+
+    #[tokio::test]
+    async fn test_send_prack() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        // Send PRACK for RSeq 1, CSeq 1 INVITE
+        phone.send_prack(1, 1, "INVITE", server_addr).await.unwrap();
+
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+
+        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+        if let SipMessage::Request(req) = &msg {
+            assert_eq!(req.method, SipMethod::Prack);
+            let rack = msg.headers().get(&HeaderName::RAck)
+                .expect("PRACK should have RAck header");
+            assert_eq!(rack.as_str(), "1 1 INVITE");
+        } else {
+            panic!("Expected PRACK request");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_prack_without_dialog_fails() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let result = phone.send_prack(1, 1, "INVITE", "127.0.0.1:5060".parse().unwrap()).await;
+        assert!(result.is_err());
+    }
+
+    // ── Incoming Call (accept_call) Tests ──────────────────────────
+
+    #[tokio::test]
+    async fn test_accept_call_responds_to_invite() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let phone_addr = phone.local_addr();
+
+        let caller_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let caller_addr = caller_socket.local_addr().unwrap();
+
+        // Build an INVITE to send to the phone
+        let invite = format!(
+"INVITE sip:siphone@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bKtest123;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:alice@example.com>;tag=caller123\r\n\
+To: <sip:siphone@{}>\r\n\
+Call-ID: test-accept-call-id\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:alice@{}>\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: 0\r\n\
+\r\n\
+v=0\r\n\
+o=- 0 0 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio {} RTP/AVP 0\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=sendrecv\r\n",
+            phone_addr, caller_addr, phone_addr, caller_addr, caller_addr.port() + 1000
+        );
+
+        // Send INVITE in background
+        let caller_socket_clone = std::sync::Arc::new(caller_socket);
+        let sender = caller_socket_clone.clone();
+        tokio::spawn(async move {
+            // Small delay to ensure phone is listening
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sender.send_to(invite.as_bytes(), phone_addr).await.unwrap();
+        });
+
+        // Accept the call
+        phone.accept_call(5).await.unwrap();
+
+        // Verify dialog was created
+        assert!(phone.dialog().is_some());
+        assert!(phone.rtp_session.is_some());
+
+        // Verify we received 180 Ringing and 200 OK
+        let mut buf = vec![0u8; 65535];
+        let mut got_ringing = false;
+        let mut got_ok = false;
+
+        for _ in 0..3 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                caller_socket_clone.recv_from(&mut buf),
+            ).await {
+                Ok(Ok((len, _))) => {
+                    let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+                    if let Some(status) = msg.status() {
+                        if status.0 == 180 { got_ringing = true; }
+                        if status.0 == 200 {
+                            got_ok = true;
+                            // 200 OK should have SDP body
+                            assert!(msg.body().is_some(), "200 OK should have SDP body");
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(got_ringing, "Should have received 180 Ringing");
+        assert!(got_ok, "Should have received 200 OK");
+    }
+
+    #[tokio::test]
+    async fn test_accept_call_timeout() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        // With a 1 second timeout and no incoming INVITE, should fail
+        let result = phone.accept_call(1).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("timeout") || err_msg.contains("Timeout"),
+            "Error should mention timeout, got: {}", err_msg);
+    }
+
+    // ── DNS SRV Resolution Tests ──────────────────────────
+
+    #[test]
+    fn test_resolve_srv_invalid_domain() {
+        // SRV lookup for nonexistent domain should return None
+        let result = resolve_srv("nonexistent.invalid.example.test");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_server_addr_with_explicit_port_skips_srv() {
+        // When port is explicit, SRV should be skipped
+        let addr = resolve_server_addr("192.168.1.1:5080").unwrap();
+        assert_eq!(addr.port(), 5080);
+    }
+
+    #[test]
+    fn test_resolve_server_addr_sip_prefix_stripped() {
+        let addr = resolve_server_addr("sip:10.0.0.1:5070").unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.1:5070");
+    }
+
+    // ── Build Register Helper Tests ──────────────────────────
+
+    #[tokio::test]
+    async fn test_build_register_without_auth() {
+        let phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let msg = phone.build_register("sip:example.com", "alice", "example.com", "call-123", 1, None);
+        let s = msg.to_string();
+        assert!(s.contains("REGISTER sip:example.com"));
+        assert!(s.contains("CSeq: 1 REGISTER"));
+        assert!(!s.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn test_build_register_with_auth() {
+        let phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let msg = phone.build_register(
+            "sip:example.com", "alice", "example.com", "call-123", 2,
+            Some((HeaderName::Authorization, "Digest username=\"alice\"".to_string())),
+        );
+        let s = msg.to_string();
+        assert!(s.contains("CSeq: 2 REGISTER"));
+        assert!(s.contains("Authorization: Digest username=\"alice\""));
     }
 }

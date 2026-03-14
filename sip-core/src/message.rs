@@ -11,6 +11,10 @@ pub enum SipMethod {
     Cancel,
     Options,
     Info,
+    Refer,
+    Notify,
+    Update,
+    Prack,
     Other(String),
 }
 
@@ -24,6 +28,10 @@ impl SipMethod {
             "CANCEL" => SipMethod::Cancel,
             "OPTIONS" => SipMethod::Options,
             "INFO" => SipMethod::Info,
+            "REFER" => SipMethod::Refer,
+            "NOTIFY" => SipMethod::Notify,
+            "UPDATE" => SipMethod::Update,
+            "PRACK" => SipMethod::Prack,
             other => SipMethod::Other(other.to_string()),
         }
     }
@@ -37,6 +45,10 @@ impl SipMethod {
             SipMethod::Cancel => "CANCEL",
             SipMethod::Options => "OPTIONS",
             SipMethod::Info => "INFO",
+            SipMethod::Refer => "REFER",
+            SipMethod::Notify => "NOTIFY",
+            SipMethod::Update => "UPDATE",
+            SipMethod::Prack => "PRACK",
             SipMethod::Other(s) => s.as_str(),
         }
     }
@@ -56,13 +68,18 @@ impl StatusCode {
     pub const RINGING: Self = Self(180);
     pub const SESSION_PROGRESS: Self = Self(183);
     pub const OK: Self = Self(200);
+    pub const ACCEPTED: Self = Self(202);
     pub const BAD_REQUEST: Self = Self(400);
     pub const UNAUTHORIZED: Self = Self(401);
     pub const FORBIDDEN: Self = Self(403);
     pub const NOT_FOUND: Self = Self(404);
+    pub const METHOD_NOT_ALLOWED: Self = Self(405);
+    pub const PROXY_AUTH_REQUIRED: Self = Self(407);
     pub const REQUEST_TIMEOUT: Self = Self(408);
+    pub const REQUEST_PENDING: Self = Self(491);
     pub const BUSY_HERE: Self = Self(486);
     pub const SERVER_ERROR: Self = Self(500);
+    pub const NOT_IMPLEMENTED: Self = Self(501);
 
     pub fn reason_phrase(&self) -> &'static str {
         match self.0 {
@@ -70,13 +87,18 @@ impl StatusCode {
             180 => "Ringing",
             183 => "Session Progress",
             200 => "OK",
+            202 => "Accepted",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
+            407 => "Proxy Authentication Required",
             408 => "Request Timeout",
             486 => "Busy Here",
+            491 => "Request Pending",
             500 => "Server Internal Error",
+            501 => "Not Implemented",
             _ => "Unknown",
         }
     }

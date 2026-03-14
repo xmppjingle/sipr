@@ -13,7 +13,7 @@
   <a href="https://github.com/xmppjingle/sipr/actions"><img src="https://github.com/xmppjingle/sipr/actions/workflows/ci.yml/badge.svg" alt="Build Status"></a>
   <a href="#quick-start"><img src="https://img.shields.io/badge/crates.io-unpublished-lightgrey.svg" alt="Crates.io unpublished"></a>
   <a href="#highlights"><img src="https://img.shields.io/badge/release-none%20yet-lightgrey.svg" alt="Release none yet"></a>
-  <a href="#highlights"><img src="https://img.shields.io/badge/tests-130%2B-brightgreen.svg" alt="130+ tests"></a>
+  <a href="#highlights"><img src="https://img.shields.io/badge/tests-220%2B-brightgreen.svg" alt="220+ tests"></a>
   <a href="#highlights"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue.svg" alt="Cross-platform"></a>
 </p>
 
@@ -26,12 +26,18 @@
 ## Highlights
 
 - **Zero-config calls** — dial a SIP URI directly, no registration needed
-- **Real-time audio** — G.711 mu-law & A-law codecs at 8 kHz, played through your system speakers
+- **Digest authentication** — RFC 2617 MD5 challenge-response for 401/407, works with Ooma, Asterisk, FreeSWITCH, etc.
+- **Incoming call support** — accept inbound INVITEs with the `listen` command
+- **Real-time audio** — G.711 mu-law & A-law codecs at 8 kHz, plus real Opus codec at 48 kHz
+- **Call hold/resume** — re-INVITE with `a=sendonly` / `a=sendrecv` SDP direction
+- **Call transfer (REFER)** — blind transfers with Refer-To and NOTIFY status updates
+- **PRACK** — reliable provisional responses (100rel / RFC 3262)
+- **DNS SRV resolution** — automatic `_sip._udp.<domain>` server discovery and failover
 - **Call recording** — save incoming audio to WAV with `--record`
 - **Cross-platform audio** — CoreAudio (macOS), ALSA (Linux), WASAPI (Windows) via [cpal](https://github.com/RustAudioGroup/cpal)
 - **Jitter buffer** — handles out-of-order and delayed packets gracefully
-- **130+ tests** — from codec round-trips to full end-to-end audio fidelity checks
-- **~8K lines of Rust** — small, auditable, hackable
+- **220+ tests** — from codec round-trips to full end-to-end SIP scenario tests
+- **~10K lines of Rust** — small, auditable, hackable
 
 ## Quick Start
 
@@ -87,6 +93,7 @@ sudo apt install ./target/debian/siphone_*_amd64.deb
 
 - Rust 1.70+
 - A working audio device (speakers + optional microphone)
+- libopus (for Opus codec support — installed automatically on most systems)
 
 ## Usage
 
@@ -98,10 +105,10 @@ The server is automatically extracted from the SIP URI — no need to specify it
 siphone call sip:bob@sip.example.com
 ```
 
-Use a custom caller identity if you want:
+Authenticate with a SIP server that requires credentials:
 
 ```sh
-siphone call sip:bob@sip.example.com --user alice
+siphone call sip:bob@sip.example.com --user alice --password secret
 ```
 
 Or route through a specific SIP proxy:
@@ -109,6 +116,31 @@ Or route through a specific SIP proxy:
 ```sh
 siphone call sip:bob@example.com --server sip.proxy.com --user alice
 ```
+
+### Accept Incoming Calls
+
+Listen for inbound INVITEs on a specific port:
+
+```sh
+siphone listen --port 5060
+siphone listen --port 5060 --record incoming.wav --timeout 120
+```
+
+### In-Call Commands
+
+After the call connects, use interactive commands:
+
+```text
+hold           # put the remote party on hold
+resume         # resume from hold
+transfer <uri> # blind transfer (REFER) to another SIP URI
+dtmf 123#      # queue/send RTP RFC2833 DTMF
+dtmf-info 55   # queue/send SIP INFO DTMF
+dtmf-send      # flush queued DTMF immediately
+dtmf-queue     # show queued DTMF count
+```
+
+Incoming DTMF is announced in the CLI for both RTP RFC2833 and SIP INFO.
 
 ### Record a Call
 
@@ -120,20 +152,9 @@ siphone call sip:echo@provider.com --user alice --record conversation.wav
 
 The recording is saved even if you hang up with `Ctrl+C`.
 
-### Send DTMF During a Call
-
-After the call connects, use interactive commands:
-
-```text
-dtmf 123#      # queue/send RTP RFC2833 DTMF
-dtmf-info 55   # queue/send SIP INFO DTMF
-dtmf-send      # flush queued DTMF immediately
-dtmf-queue     # show queued DTMF count
-```
-
-Incoming DTMF is announced in the CLI for both RTP RFC2833 and SIP INFO.
-
 ### Register with a SIP Server
+
+Registration supports digest authentication automatically:
 
 ```sh
 siphone register --server sip.example.com --user alice --password secret
@@ -159,14 +180,16 @@ siphone test-mic
 ```
 sipr/
 ├── sip-core/     # SIP protocol engine
-│   ├── Message parsing & serialization (INVITE, ACK, BYE, REGISTER, OPTIONS)
+│   ├── Message parsing & serialization (INVITE, ACK, BYE, REGISTER, REFER, PRACK, …)
+│   ├── Digest authentication (RFC 2617) with pure-Rust MD5
 │   ├── UDP transport layer
 │   ├── Dialog & transaction state machines
-│   └── SDP offer/answer negotiation
+│   └── SDP offer/answer negotiation (including hold/resume direction)
 │
 ├── rtp-core/     # Real-time audio engine
 │   ├── RTP packet parsing & construction
 │   ├── G.711 mu-law (PCMU) & A-law (PCMA) codecs
+│   ├── Real Opus codec (48 kHz via audiopus)
 │   ├── Adaptive jitter buffer
 │   ├── Audio device abstraction (cpal backend)
 │   ├── Sample rate conversion & channel mapping
@@ -174,7 +197,10 @@ sipr/
 │
 └── siphone/      # CLI application
     ├── Call management (INVITE → media → BYE)
-    ├── Registration flow
+    ├── Incoming call acceptance (UAS / listen mode)
+    ├── Hold, resume, blind transfer (REFER), PRACK
+    ├── DNS SRV resolution (_sip._udp.domain)
+    ├── Registration with digest auth
     └── Audio device enumeration & testing
 ```
 
@@ -203,7 +229,7 @@ sipr/
 
 1. **SIP signaling** sets up the call (INVITE → 200 OK → ACK)
 2. **SDP negotiation** agrees on codec and RTP port
-3. **RTP packets** carry G.711-encoded audio at 8 kHz
+3. **RTP packets** carry G.711 or Opus-encoded audio
 4. **Jitter buffer** reorders packets and smooths playback
 5. **cpal** plays decoded audio through your speakers (with automatic sample rate conversion)
 6. Optionally, decoded audio is written to a **WAV file**

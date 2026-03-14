@@ -69,16 +69,42 @@ enum Commands {
         /// SIP username (optional; auto-derived when omitted)
         #[arg(long)]
         user: Option<String>,
+        /// SIP password for authentication
+        #[arg(long)]
+        password: Option<String>,
         /// Local UDP port for SIP signaling (default: 5060)
         #[arg(long, default_value = "5060")]
         port: u16,
-        /// Audio codec to use: pcmu (G.711 mu-law) or pcma (G.711 A-law)
+        /// Audio codec to use: pcmu, pcma, or opus
         #[arg(long, default_value = "pcmu", value_parser = parse_codec)]
         codec: rtp_core::CodecType,
         /// Input audio device (microphone): "default", device index, or name substring
         #[arg(long, default_value = "default")]
         input_device: String,
         /// Output audio device (speaker): "default", device index, or name substring
+        #[arg(long, default_value = "default")]
+        output_device: String,
+        /// Record received audio to a WAV file
+        #[arg(long)]
+        record: Option<String>,
+    },
+
+    /// Listen for incoming SIP calls
+    #[command(long_about = "Listen for incoming SIP INVITE requests and accept them.\n\n\
+                            Examples:\n  \
+                              siphone listen\n  \
+                              siphone listen --port 5060 --timeout 60")]
+    Listen {
+        /// Local UDP port for SIP signaling
+        #[arg(long, default_value = "5060")]
+        port: u16,
+        /// Timeout in seconds to wait for incoming call
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+        /// Input audio device
+        #[arg(long, default_value = "default")]
+        input_device: String,
+        /// Output audio device
         #[arg(long, default_value = "default")]
         output_device: String,
         /// Record received audio to a WAV file
@@ -177,7 +203,8 @@ fn parse_codec(s: &str) -> Result<rtp_core::CodecType, String> {
     match s.to_lowercase().as_str() {
         "pcmu" | "ulaw" | "g711u" => Ok(rtp_core::CodecType::Pcmu),
         "pcma" | "alaw" | "g711a" => Ok(rtp_core::CodecType::Pcma),
-        _ => Err(format!("Unknown codec '{}'. Supported: pcmu, pcma", s)),
+        "opus" => Ok(rtp_core::CodecType::Opus),
+        _ => Err(format!("Unknown codec '{}'. Supported: pcmu, pcma, opus", s)),
     }
 }
 
@@ -195,32 +222,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
         } => {
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
-            phone.register(&server, &user, &password).await?;
-            println!("Registration sent to {}", server);
-
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                phone.wait_for_response(),
-            )
-            .await
-            {
-                Ok(Ok(msg)) => {
-                    if let Some(status) = msg.status() {
-                        if status.is_success() {
-                            println!("Registered successfully!");
-                        } else {
-                            println!("Registration failed: {} {}", status, status.reason_phrase());
-                        }
-                    }
-                }
-                Ok(Err(e)) => println!("Error: {}", e),
-                Err(_) => println!("Registration timed out"),
+            match phone.register(&server, &user, &password).await {
+                Ok(()) => println!("Registered successfully with {}", server),
+                Err(e) => println!("Registration failed: {}", e),
             }
         }
         Commands::Call {
             uri,
             server,
             user,
+            password,
             port,
             codec: _codec,
             input_device,
@@ -245,6 +256,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
+            if let (Some(ref u), Some(ref p)) = (&user, &password) {
+                phone.set_credentials(u, p);
+            }
             phone.call(&uri, server.as_deref(), user.as_deref()).await?;
             println!("Calling {}...", uri);
 
@@ -280,6 +294,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((path, rec)) = phone.take_live_recording() {
                 if rec.frame_count() > 0 {
                     match rec.save_wav(&path) {
+                        Ok(_) => println!("Saved recording to {} ({:.1}s, {} frames)",
+                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count()),
+                        Err(e) => println!("Failed to save recording: {}", e),
+                    }
+                }
+            }
+        }
+        Commands::Listen {
+            port,
+            timeout,
+            input_device,
+            output_device,
+            record,
+        } => {
+            println!("Listening for incoming SIP calls on port {}...", port);
+            if !rtp_core::audio_device::is_audio_available() {
+                println!(
+                    "Warning: {}",
+                    rtp_core::audio_device::audio_unavailable_reason()
+                );
+                println!("Call will proceed without live audio (RTP only).");
+            }
+
+            let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
+            phone.accept_call(timeout).await?;
+            println!("Call accepted!");
+
+            let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
+            tokio::select! {
+                result = phone.run_call(recorder.as_mut(), &input_device, &output_device) => {
+                    match result {
+                        Ok(_) => println!("Call ended"),
+                        Err(e) => println!("Call error: {}", e),
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nHanging up...");
+                    phone.hangup().await?;
+                    println!("Call ended");
+                }
+            }
+
+            if let (Some(path), Some(ref rec)) = (&record, &recorder) {
+                if rec.frame_count() > 0 {
+                    match rec.save_wav(path) {
                         Ok(_) => println!("Saved recording to {} ({:.1}s, {} frames)",
                             path, rec.duration_ms() as f64 / 1000.0, rec.frame_count()),
                         Err(e) => println!("Failed to save recording: {}", e),
