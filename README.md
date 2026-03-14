@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.70%2B-orange.svg" alt="Rust"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg" alt="License: PolyForm Noncommercial 1.0.0"></a>
   <a href="https://github.com/xmppjingle/sipr/actions"><img src="https://github.com/xmppjingle/sipr/actions/workflows/ci.yml/badge.svg" alt="Build Status"></a>
   <a href="#quick-start"><img src="https://img.shields.io/badge/crates.io-unpublished-lightgrey.svg" alt="Crates.io unpublished"></a>
   <a href="#highlights"><img src="https://img.shields.io/badge/release-none%20yet-lightgrey.svg" alt="Release none yet"></a>
@@ -194,4 +194,4 @@ RUST_LOG=debug siphone call sip:test@example.com --user test
 
 ## License
 
-[MIT](LICENSE) — use it however you like.
+[PolyForm Noncommercial 1.0.0](LICENSE) — free to use, modify, and share for noncommercial purposes.
