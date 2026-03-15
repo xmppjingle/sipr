@@ -34,6 +34,9 @@
 - **PRACK** — reliable provisional responses (100rel / RFC 3262)
 - **DNS SRV resolution** — automatic `_sip._udp.<domain>` server discovery and failover
 - **Call recording** — save incoming audio to WAV with `--record`
+- **Interactive command history** — Up/Down navigation with persistent history in `~/.sipr.history`
+- **Reverse history search** — `Ctrl+R` incremental search inside in-call CLI
+- **SIP + RTP flow tracing** — `sniff`/`flows` now shows early media and connected RTP flow events
 - **Cross-platform audio** — CoreAudio (macOS), ALSA (Linux), WASAPI (Windows) via [cpal](https://github.com/RustAudioGroup/cpal)
 - **Jitter buffer** — handles out-of-order and delayed packets gracefully
 - **220+ tests** — from codec round-trips to full end-to-end SIP scenario tests
@@ -50,6 +53,20 @@ siphone call sip:echo@sip.provider.com
 ```
 
 Press **`Ctrl+C`** to hang up.
+
+## Changelog (short)
+
+### Unreleased
+
+- Added persistent in-call history (`~/.sipr.history`) with Up/Down navigation.
+- Added `Ctrl+R` reverse search for in-call command history.
+- Added `max_history` config option (default `1000`) to cap stored history entries.
+- Added RTP flow visibility in `flows`, including:
+  - early media RTP announced on `183`
+  - connected RTP announced on `200 OK`
+  - first active RTP `RX` and `TX` events
+- Improved terminal rendering in interactive mode (fixed drift/skew under raw mode).
+- Updated `hangup` command to wait for BYE `200 OK` (or timeout after 3s).
 
 ## Installation
 
@@ -138,9 +155,30 @@ dtmf 123#      # queue/send RTP RFC2833 DTMF
 dtmf-info 55   # queue/send SIP INFO DTMF
 dtmf-send      # flush queued DTMF immediately
 dtmf-queue     # show queued DTMF count
+sniff          # start SIP tracing
+sniff verbose  # SIP tracing with full message details
+flows          # show SIP ladder + RTP flow events (EARLY/CONNECTED/RX/TX)
+hangup         # send BYE and wait for 200 OK (up to 3 seconds)
 ```
 
 Incoming DTMF is announced in the CLI for both RTP RFC2833 and SIP INFO.
+Use **Up/Down** for history and **Ctrl+R** to search history.
+
+### Config File
+
+Generate a template and save it:
+
+```sh
+siphone config --init > ~/.config/sipr/config.json
+```
+
+Example history limit:
+
+```json
+{
+  "max_history": 1000
+}
+```
 
 ### Record a Call
 

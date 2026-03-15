@@ -1,5 +1,7 @@
+mod config;
 mod phone;
 mod sip_debug;
+pub(crate) mod ui;
 
 use clap::{Parser, Subcommand};
 use phone::SoftPhone;
@@ -24,6 +26,10 @@ use rtp_core::audio_device::TestToneGenerator;
     after_help = "Use 'siphone <COMMAND> --help' for more information about a specific command."
 )]
 struct Cli {
+    /// Disable colored output
+    #[arg(long, global = true)]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -38,16 +44,16 @@ enum Commands {
     Register {
         /// SIP server address (e.g., sip.example.com or 192.168.1.1:5060)
         #[arg(long)]
-        server: String,
+        server: Option<String>,
         /// SIP username for authentication
         #[arg(long)]
-        user: String,
+        user: Option<String>,
         /// SIP password for authentication
         #[arg(long)]
-        password: String,
-        /// Local UDP port to bind for SIP signaling (default: 5060)
-        #[arg(long, default_value = "5060")]
-        port: u16,
+        password: Option<String>,
+        /// Local UDP port to bind for SIP signaling (0 = random)
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// Make an outbound SIP call
@@ -72,21 +78,24 @@ enum Commands {
         /// SIP password for authentication
         #[arg(long)]
         password: Option<String>,
-        /// Local UDP port for SIP signaling (default: 5060)
-        #[arg(long, default_value = "5060")]
-        port: u16,
+        /// Local UDP port for SIP signaling (0 = random)
+        #[arg(long)]
+        port: Option<u16>,
         /// Audio codec to use: pcmu, pcma, or opus
-        #[arg(long, default_value = "pcmu", value_parser = parse_codec)]
-        codec: rtp_core::CodecType,
+        #[arg(long, value_parser = parse_codec)]
+        codec: Option<rtp_core::CodecType>,
         /// Input audio device (microphone): "default", device index, or name substring
-        #[arg(long, default_value = "default")]
-        input_device: String,
+        #[arg(long)]
+        input_device: Option<String>,
         /// Output audio device (speaker): "default", device index, or name substring
-        #[arg(long, default_value = "default")]
-        output_device: String,
+        #[arg(long)]
+        output_device: Option<String>,
         /// Record received audio to a WAV file
         #[arg(long)]
         record: Option<String>,
+        /// Enable SIP tracing from the start (sngrep-like)
+        #[arg(long)]
+        sniff: bool,
     },
 
     /// Listen for incoming SIP calls
@@ -102,11 +111,11 @@ enum Commands {
         #[arg(long, default_value = "120")]
         timeout: u64,
         /// Input audio device
-        #[arg(long, default_value = "default")]
-        input_device: String,
+        #[arg(long)]
+        input_device: Option<String>,
         /// Output audio device
-        #[arg(long, default_value = "default")]
-        output_device: String,
+        #[arg(long)]
+        output_device: Option<String>,
         /// Record received audio to a WAV file
         #[arg(long)]
         record: Option<String>,
@@ -197,6 +206,26 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
     },
+
+    /// Show or create configuration file
+    #[command(long_about = "Manage the sipr configuration file.\n\n\
+                            Config is loaded from ~/.config/sipr/config.json or ~/.sipr.json.\n\
+                            CLI flags always override config file values.\n\n\
+                            Examples:\n  \
+                              siphone config --path\n  \
+                              siphone config --init > ~/.config/sipr/config.json\n  \
+                              siphone config --show")]
+    Config {
+        /// Print the config file path
+        #[arg(long)]
+        path: bool,
+        /// Print example config template to stdout
+        #[arg(long)]
+        init: bool,
+        /// Print the currently loaded config
+        #[arg(long)]
+        show: bool,
+    },
 }
 
 fn parse_codec(s: &str) -> Result<rtp_core::CodecType, String> {
@@ -213,6 +242,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    let cfg = config::SiprConfig::load();
+
+    // Apply color settings
+    if cli.no_color || cfg.no_color.unwrap_or(false) {
+        ui::set_color_enabled(false);
+    }
+
+    ui::print_banner();
+
+    if cfg.password.is_some() {
+        ui::warning("Config file contains a plaintext password.");
+    }
 
     match cli.command {
         Commands::Register {
@@ -221,10 +262,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             password,
             port,
         } => {
+            // Merge: CLI > config > error
+            let server = server.or(cfg.server.clone())
+                .ok_or("--server is required (or set 'server' in config file)")?;
+            let user = user.or(cfg.user.clone())
+                .ok_or("--user is required (or set 'user' in config file)")?;
+            let password = password.or(cfg.password.clone())
+                .ok_or("--password is required (or set 'password' in config file)")?;
+            let port = port.or(cfg.port).unwrap_or(0);
+
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
             match phone.register(&server, &user, &password).await {
-                Ok(()) => println!("Registered successfully with {}", server),
-                Err(e) => println!("Registration failed: {}", e),
+                Ok(()) => ui::success(&format!("Registered successfully with {}", server)),
+                Err(e) => ui::error(&format!("Registration failed: {}", e)),
             }
         }
         Commands::Call {
@@ -233,47 +283,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             user,
             password,
             port,
-            codec: _codec,
+            codec,
             input_device,
             output_device,
             record,
+            sniff,
         } => {
+            // Merge: CLI > config > defaults
+            let server = server.or(cfg.server.clone());
+            let user = user.or(cfg.user.clone());
+            let password = password.or(cfg.password.clone());
+            let port = port.or(cfg.port).unwrap_or(0);
+            let codec = codec.or(cfg.codec).unwrap_or(rtp_core::CodecType::Pcmu);
+            let input_device = input_device.or(cfg.input_device.clone()).unwrap_or_else(|| "default".into());
+            let output_device = output_device.or(cfg.output_device.clone()).unwrap_or_else(|| "default".into());
+            let record = record.or(cfg.record_path.clone());
+            let sniff = sniff || cfg.sniff.unwrap_or(false);
+            let max_history = cfg.max_history.unwrap_or(1000);
+
             // Report device selection
             let input_sel = DeviceSelector::from_arg(&input_device);
             let output_sel = DeviceSelector::from_arg(&output_device);
-            println!("Audio input:  {}", input_sel);
-            println!("Audio output: {}", output_sel);
+            ui::info(&format!("Audio input:  {}", input_sel));
+            ui::info(&format!("Audio output: {}", output_sel));
             if let Some(ref path) = record {
-                println!("Recording to: {}", path);
+                ui::status(&format!("Recording to: {}", path));
             }
 
             if !rtp_core::audio_device::is_audio_available() {
-                println!(
-                    "Warning: {}",
-                    rtp_core::audio_device::audio_unavailable_reason()
-                );
-                println!("Call will proceed without live audio (RTP only).");
+                ui::warning(&rtp_core::audio_device::audio_unavailable_reason());
+                ui::warning("Call will proceed without live audio (RTP only).");
             }
 
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
-            if let (Some(ref u), Some(ref p)) = (&user, &password) {
-                phone.set_credentials(u, p);
-            }
-            phone.call(&uri, server.as_deref(), user.as_deref()).await?;
-            println!("Calling {}...", uri);
+            phone
+                .call(
+                    &uri,
+                    server.as_deref(),
+                    user.as_deref(),
+                    password.as_deref(),
+                    codec,
+                )
+                .await?;
+            ui::event(&format!("Calling {}...", uri));
 
             let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
             tokio::select! {
-                result = phone.run_call(recorder.as_mut(), &input_device, &output_device) => {
+                result = phone.run_call(
+                    recorder.as_mut(),
+                    &input_device,
+                    &output_device,
+                    sniff,
+                    max_history,
+                ) => {
                     match result {
-                        Ok(_) => println!("Call ended"),
-                        Err(e) => println!("Call error: {}", e),
+                        Ok(_) => ui::event("Call ended"),
+                        Err(e) => ui::error(&format!("Call error: {}", e)),
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    println!("\nHanging up...");
+                    ui::info("\nHanging up...");
                     phone.hangup().await?;
-                    println!("Call ended");
+                    ui::event("Call ended");
                 }
             }
 
@@ -281,12 +352,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let (Some(path), Some(ref rec)) = (&record, &recorder) {
                 if rec.frame_count() > 0 {
                     match rec.save_wav(path) {
-                        Ok(_) => println!("Saved recording to {} ({:.1}s, {} frames)",
-                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count()),
-                        Err(e) => println!("Failed to save recording: {}", e),
+                        Ok(_) => ui::success(&format!("Saved recording to {} ({:.1}s, {} frames)",
+                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count())),
+                        Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
                     }
                 } else {
-                    println!("No audio frames received, recording not saved.");
+                    ui::info("No audio frames received, recording not saved.");
                 }
             }
 
@@ -294,9 +365,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((path, rec)) = phone.take_live_recording() {
                 if rec.frame_count() > 0 {
                     match rec.save_wav(&path) {
-                        Ok(_) => println!("Saved recording to {} ({:.1}s, {} frames)",
-                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count()),
-                        Err(e) => println!("Failed to save recording: {}", e),
+                        Ok(_) => ui::success(&format!("Saved recording to {} ({:.1}s, {} frames)",
+                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count())),
+                        Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
                     }
                 }
             }
@@ -308,40 +379,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_device,
             record,
         } => {
-            println!("Listening for incoming SIP calls on port {}...", port);
+            let input_device = input_device.unwrap_or_else(|| cfg.input_device.clone().unwrap_or_else(|| "default".into()));
+            let output_device = output_device.unwrap_or_else(|| cfg.output_device.clone().unwrap_or_else(|| "default".into()));
+            let max_history = cfg.max_history.unwrap_or(1000);
+            ui::event(&format!("Listening for incoming SIP calls on port {}...", port));
             if !rtp_core::audio_device::is_audio_available() {
-                println!(
-                    "Warning: {}",
-                    rtp_core::audio_device::audio_unavailable_reason()
-                );
-                println!("Call will proceed without live audio (RTP only).");
+                ui::warning(&rtp_core::audio_device::audio_unavailable_reason());
+                ui::warning("Call will proceed without live audio (RTP only).");
             }
 
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
             phone.accept_call(timeout).await?;
-            println!("Call accepted!");
+            ui::success("Call accepted!");
 
             let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
             tokio::select! {
-                result = phone.run_call(recorder.as_mut(), &input_device, &output_device) => {
+                result = phone.run_call(
+                    recorder.as_mut(),
+                    &input_device,
+                    &output_device,
+                    false,
+                    max_history,
+                ) => {
                     match result {
-                        Ok(_) => println!("Call ended"),
-                        Err(e) => println!("Call error: {}", e),
+                        Ok(_) => ui::event("Call ended"),
+                        Err(e) => ui::error(&format!("Call error: {}", e)),
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    println!("\nHanging up...");
+                    ui::info("\nHanging up...");
                     phone.hangup().await?;
-                    println!("Call ended");
+                    ui::event("Call ended");
                 }
             }
 
             if let (Some(path), Some(ref rec)) = (&record, &recorder) {
                 if rec.frame_count() > 0 {
                     match rec.save_wav(path) {
-                        Ok(_) => println!("Saved recording to {} ({:.1}s, {} frames)",
-                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count()),
-                        Err(e) => println!("Failed to save recording: {}", e),
+                        Ok(_) => ui::success(&format!("Saved recording to {} ({:.1}s, {} frames)",
+                            path, rec.duration_ms() as f64 / 1000.0, rec.frame_count())),
+                        Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
                     }
                 }
             }
@@ -376,6 +453,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let filter_method = filter.map(|f| sip_core::message::SipMethod::from_str(&f));
             sip_debug::run_sniffer(port, verbose, filter_method).await?;
+        }
+        Commands::Config { path, init, show } => {
+            if init {
+                // Print template to stdout (user can redirect to file)
+                println!("{}", config::SiprConfig::template());
+            } else if path {
+                println!("Config search paths:");
+                for p in config::SiprConfig::config_paths() {
+                    let exists = if p.exists() { " (found)" } else { "" };
+                    println!("  {}{}", p.display(), exists);
+                }
+                if let Some(active) = config::SiprConfig::active_path() {
+                    ui::success(&format!("Active: {}", active.display()));
+                } else {
+                    ui::info("No config file found. Create one with: siphone config --init");
+                }
+            } else if show {
+                if let Some(active) = config::SiprConfig::active_path() {
+                    ui::info(&format!("Loaded from: {}", active.display()));
+                }
+                println!("{}", serde_json::to_string_pretty(&cfg)?);
+            } else {
+                // Default: show path + current config
+                if let Some(active) = config::SiprConfig::active_path() {
+                    ui::success(&format!("Config: {}", active.display()));
+                    println!("{}", serde_json::to_string_pretty(&cfg)?);
+                } else {
+                    ui::info("No config file found.");
+                    println!("Create one with:");
+                    let default_path = config::SiprConfig::default_path();
+                    println!("  mkdir -p {}", default_path.parent().unwrap().display());
+                    println!("  siphone config --init > {}", default_path.display());
+                }
+            }
         }
     }
 

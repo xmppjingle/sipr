@@ -1,4 +1,6 @@
 use crate::sip_debug::SipDebugger;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use rtp_core::audio_device::{AudioConfig, DeviceSelector};
 use rtp_core::{AudioRecorder, CodecType, ReceiveEvent, RtpSession, SessionConfig};
 use sip_core::auth::{self, Credentials};
@@ -8,9 +10,9 @@ use sip_core::sdp::SdpSession;
 use sip_core::dialog::SipDialog;
 use sip_core::transport::SipTransport;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::net::SocketAddr;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -60,6 +62,13 @@ pub struct SoftPhone {
 }
 
 impl SoftPhone {
+    fn active_call_id(&self) -> Option<String> {
+        self.dialog
+            .as_ref()
+            .map(|d| d.call_id.clone())
+            .or_else(|| self.call_id.clone())
+    }
+
     pub async fn new(bind_addr: &str) -> Result<Self, PhoneError> {
         let transport = SipTransport::bind(bind_addr).await?;
         let local_addr = transport.local_addr();
@@ -106,7 +115,7 @@ impl SoftPhone {
         self.reg_user = Some(user.to_string());
 
         let call_id = Uuid::new_v4().to_string();
-        let server_addr = resolve_server_addr(server)?;
+        let server_addr = resolve_server_addr(server).await?;
 
         let server_uri = if server.starts_with("sip:") {
             server.to_string()
@@ -225,6 +234,8 @@ impl SoftPhone {
         uri: &str,
         server: Option<&str>,
         user: Option<&str>,
+        password: Option<&str>,
+        codec: CodecType,
     ) -> Result<(), PhoneError> {
         let target_uri = if uri.starts_with("sip:") {
             uri.to_string()
@@ -236,6 +247,9 @@ impl SoftPhone {
             .or_else(|| extract_user_from_uri(&target_uri))
             .or_else(|| std::env::var("USER").ok())
             .unwrap_or_else(|| "siphone".to_string());
+        if let Some(pw) = password {
+            self.set_credentials(&caller_user, pw);
+        }
 
         // Extract host from URI if no server given: sip:user@host -> host
         let server_host = if let Some(s) = server {
@@ -252,8 +266,8 @@ impl SoftPhone {
         let local_addr = self.transport.local_addr();
 
         // Create RTP session for audio
-        let rtp_remote = resolve_server_addr(&server_host)?;
-        let rtp_config = SessionConfig::new("0.0.0.0:0", rtp_remote, CodecType::Pcmu);
+        let rtp_remote = resolve_server_addr(&server_host).await?;
+        let rtp_config = SessionConfig::new("0.0.0.0:0", rtp_remote, codec);
         let rtp_session = RtpSession::new(rtp_config).await?;
         let rtp_port = rtp_session.local_addr().port();
 
@@ -291,7 +305,7 @@ impl SoftPhone {
             .body(&sdp_body)
             .build();
 
-        let server_addr = resolve_server_addr(&server_host)?;
+        let server_addr = resolve_server_addr(&server_host).await?;
         self.transport.send_to(&request, server_addr).await?;
 
         // Create dialog
@@ -343,6 +357,8 @@ impl SoftPhone {
         mut recorder: Option<&mut AudioRecorder>,
         input_device: &str,
         output_device: &str,
+        sniff: bool,
+        max_history: usize,
     ) -> Result<(), PhoneError> {
         let (mut rx, _sip_stop_tx) = self.transport.start_receiving(32);
         let mut rtp_stop_tx: Option<tokio::sync::mpsc::Sender<()>> = None;
@@ -355,26 +371,27 @@ impl SoftPhone {
         let mut announced_audio_tx = false;
         let mut announced_audio_rx = false;
         let mut debugger = SipDebugger::new(false);
+        if sniff {
+            debugger.start(true);
+            crate::ui::status("SIP tracing enabled. All SIP messages will be displayed.");
+        }
         let local_addr = self.transport.local_addr();
         let audio_config = AudioConfig::telephony();
         let input_sel = DeviceSelector::from_arg(input_device);
         let output_sel = DeviceSelector::from_arg(output_device);
+        let (mut cmd_rx, cmd_stop_tx) = start_interactive_command_reader(max_history);
 
         #[cfg(feature = "audio-device")]
         let mut mic_capture: Option<rtp_core::audio_device::AudioCapture> = None;
         #[cfg(feature = "audio-device")]
         let mut speaker_playback: Option<rtp_core::audio_device::AudioPlayback> = None;
 
-        // Interactive stdin reader
-        let stdin = tokio::io::stdin();
-        let mut stdin_reader = BufReader::new(stdin).lines();
-
         // Send silence every 20ms to keep NAT pinhole open and trigger remote RTP
         let mut silence_interval = tokio::time::interval(std::time::Duration::from_millis(20));
         silence_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         if recorder.is_some() {
-            println!("Recording active.");
+            crate::ui::status("Recording active.");
         }
         if rtp_core::audio_device::is_audio_available() {
             #[cfg(feature = "audio-device")]
@@ -382,26 +399,26 @@ impl SoftPhone {
                 match rtp_core::audio_device::AudioCapture::start(&input_sel, &audio_config) {
                     Ok(cap) => {
                         mic_capture = Some(cap);
-                        println!("Live mic capture enabled: {}", input_sel);
+                        crate::ui::status(&format!("Live mic capture enabled: {}", input_sel));
                     }
                     Err(e) => {
-                        println!("Mic capture unavailable (using silence TX): {}", e);
+                        crate::ui::warning(&format!("Mic capture unavailable (using silence TX): {}", e));
                     }
                 }
                 match rtp_core::audio_device::AudioPlayback::start(&output_sel, &audio_config) {
                     Ok(pb) => {
                         speaker_playback = Some(pb);
-                        println!("Live speaker playback enabled: {}", output_sel);
+                        crate::ui::status(&format!("Live speaker playback enabled: {}", output_sel));
                     }
                     Err(e) => {
-                        println!("Speaker playback unavailable: {}", e);
+                        crate::ui::warning(&format!("Speaker playback unavailable: {}", e));
                     }
                 }
             }
         } else {
-            println!("No live audio device available; RTP will run without local playback/capture.");
+            crate::ui::info("No live audio device available; RTP will run without local playback/capture.");
         }
-        println!("Type 'help' for interactive commands.");
+        crate::ui::info("Type 'help' for interactive commands. Press Ctrl+R for history search. Press Ctrl+C to hang up.");
 
         loop {
             tokio::select! {
@@ -422,14 +439,22 @@ impl SoftPhone {
                                     if let Some(ref rtp) = self.rtp_session {
                                         let s = rtp.stats();
                                         let codec = s.codec;
-                                        println!(
+                                        crate::ui::status(&format!(
                                             "Audio RX active: codec={} PT={} rate={}Hz",
                                             codec,
                                             codec.payload_type(),
                                             codec.clock_rate()
-                                        );
+                                        ));
+                                        if let Some(call_id) = self.active_call_id() {
+                                            debugger.capture_rtp_event(
+                                                &call_id,
+                                                s.remote_addr,
+                                                s.local_addr,
+                                                "RTP audio flow active (RX)",
+                                            );
+                                        }
                                     } else {
-                                        println!("Audio RX active.");
+                                        crate::ui::status("Audio RX active.");
                                     }
                                     announced_audio_rx = true;
                                 }
@@ -453,7 +478,7 @@ impl SoftPhone {
                                                         let key = (dtmf.digit, dtmf.timestamp);
                                                         if self.last_announced_rfc2833 != Some(key) {
                                                             self.last_announced_rfc2833 = Some(key);
-                                                            println!("DTMF received (RTP RFC2833): {}", dtmf.digit);
+                                                            crate::ui::event(&format!("DTMF received (RTP RFC2833): {}", dtmf.digit));
                                                         }
                                                     }
                                                 }
@@ -468,7 +493,7 @@ impl SoftPhone {
                                     let key = (dtmf.digit, dtmf.timestamp);
                                     if self.last_announced_rfc2833 != Some(key) {
                                         self.last_announced_rfc2833 = Some(key);
-                                        println!("DTMF received (RTP RFC2833): {}", dtmf.digit);
+                                        crate::ui::event(&format!("DTMF received (RTP RFC2833): {}", dtmf.digit));
                                     }
                                 }
                             }
@@ -491,7 +516,7 @@ impl SoftPhone {
 
                             if let Some(status) = msg.status() {
                                 if status.is_provisional() {
-                                    println!("Call progress: {} {}", status, status.reason_phrase());
+                                    crate::ui::info(&format!("Call progress: {} {}", status, status.reason_phrase()));
 
                                     // Handle PRACK: if response has Require: 100rel and RSeq, send PRACK
                                     if let Some(require) = msg.headers().get(&HeaderName::Require) {
@@ -514,9 +539,9 @@ impl SoftPhone {
                                                         .header(HeaderName::UserAgent, "siphone/0.1.0")
                                                         .build();
                                                     if let Err(e) = self.transport.send_to(&prack, incoming.source).await {
-                                                        println!("Failed to send PRACK: {}", e);
+                                                        crate::ui::error(&format!("Failed to send PRACK: {}", e));
                                                     } else {
-                                                        println!("PRACK sent for RSeq {}", rseq);
+                                                        crate::ui::info(&format!("PRACK sent for RSeq {}", rseq));
                                                     }
                                                 }
                                             }
@@ -531,7 +556,14 @@ impl SoftPhone {
                                                 if rtp_event_rx.is_none() {
                                                     if let Some(ref mut rtp) = self.rtp_session {
                                                         rtp.set_remote_addr(addr);
-                                                        println!("Early media: RTP remote {}", addr);
+                                                        crate::ui::status(&format!("Early media: RTP remote {}", addr));
+                                                        let call_id = dialog.call_id.clone();
+                                                        debugger.capture_rtp_event(
+                                                            &call_id,
+                                                            rtp.local_addr(),
+                                                            addr,
+                                                            "Early media RTP announced (183)",
+                                                        );
                                                         let (erx, stx) = rtp.start_receiving_events(
                                                             1024,
                                                             self.remote_dtmf_payload_type,
@@ -545,7 +577,7 @@ impl SoftPhone {
                                         }
                                     }
                                 } else if status.is_success() {
-                                    println!("Call connected!");
+                                    crate::ui::success("Call connected!");
                                     self.remote_sip_addr = Some(incoming.source);
 
                                     // Parse SDP from response to get remote RTP addr
@@ -553,11 +585,18 @@ impl SoftPhone {
                                         if let Some((addr, dtmf_pt)) = parse_sdp_rtp_addr(body) {
                                             self.remote_dtmf_payload_type = dtmf_pt;
                                             if let Some(pt) = dtmf_pt {
-                                                println!("Remote DTMF RTP payload type: {}", pt);
+                                                crate::ui::info(&format!("Remote DTMF RTP payload type: {}", pt));
                                             }
                                             if let Some(ref mut rtp) = self.rtp_session {
                                                 rtp.set_remote_addr(addr);
-                                                println!("RTP remote: {}", addr);
+                                                crate::ui::info(&format!("RTP remote: {}", addr));
+                                                let call_id = dialog.call_id.clone();
+                                                debugger.capture_rtp_event(
+                                                    &call_id,
+                                                    rtp.local_addr(),
+                                                    addr,
+                                                    "Connected call RTP announced (200 OK)",
+                                                );
                                                 // Only start RTP receiver if not already active from early media (183)
                                                 if rtp_event_rx.is_none() {
                                                     let (erx, stx) = rtp.start_receiving_events(
@@ -577,7 +616,7 @@ impl SoftPhone {
                                     debugger.capture_outgoing(&ack, local_addr, incoming.source);
                                     self.transport.send_to(&ack, incoming.source).await?;
                                 } else if status.is_error() {
-                                    println!("Call failed: {} {}", status, status.reason_phrase());
+                                    crate::ui::error(&format!("Call failed: {} {}", status, status.reason_phrase()));
                                     // Send ACK for non-2xx final responses (RFC 3261 §17.1.1.3)
                                     let ack = build_ack_msg(dialog, &self.transport.local_addr());
                                     debugger.capture_outgoing(&ack, local_addr, incoming.source);
@@ -591,7 +630,7 @@ impl SoftPhone {
                             }
                         } else if let Some(method) = msg.method() {
                             if *method == SipMethod::Bye {
-                                println!("Remote party hung up");
+                                crate::ui::event("Remote party hung up");
                                 // Send 200 OK to BYE (RFC 3261 §15.1.2)
                                 if let SipMessage::Request(ref req) = msg {
                                     let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
@@ -602,12 +641,12 @@ impl SoftPhone {
                                 break;
                             } else if *method == SipMethod::Info {
                                 if let Some((digit, duration)) = parse_info_dtmf(msg.body()) {
-                                    println!(
+                                    crate::ui::event(&format!(
                                         "DTMF received (SIP INFO): {} (duration {})",
                                         digit, duration
-                                    );
+                                    ));
                                 } else {
-                                    println!("SIP INFO received");
+                                    crate::ui::info("SIP INFO received");
                                 }
                                 if let SipMessage::Request(ref req) = msg {
                                     let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
@@ -616,21 +655,21 @@ impl SoftPhone {
                                 }
                             } else if *method == SipMethod::Invite {
                                 // re-INVITE (hold/resume from remote)
-                                println!("Re-INVITE received");
+                                crate::ui::event("Re-INVITE received");
                                 if let Some(body) = msg.body() {
                                     if let Ok(sdp) = SdpSession::parse(body) {
                                         match sdp.get_audio_direction() {
                                             Some("sendonly") => {
-                                                println!("Remote put call on hold");
+                                                crate::ui::warning("Remote put call on hold");
                                                 self.on_hold = true;
                                             }
                                             Some("inactive") => {
-                                                println!("Remote put call on hold (inactive)");
+                                                crate::ui::warning("Remote put call on hold (inactive)");
                                                 self.on_hold = true;
                                             }
                                             _ => {
                                                 if self.on_hold {
-                                                    println!("Remote resumed call");
+                                                    crate::ui::success("Remote resumed call");
                                                     self.on_hold = false;
                                                 }
                                             }
@@ -654,7 +693,7 @@ impl SoftPhone {
                             } else if *method == SipMethod::Refer {
                                 // Incoming REFER (transfer request)
                                 if let Some(refer_to) = msg.headers().get(&HeaderName::ReferTo) {
-                                    println!("Transfer requested to: {}", refer_to.as_str());
+                                    crate::ui::event(&format!("Transfer requested to: {}", refer_to.as_str()));
                                     // Accept the REFER
                                     if let SipMessage::Request(ref req) = msg {
                                         let accepted = ResponseBuilder::from_request(req, StatusCode::ACCEPTED).build();
@@ -685,7 +724,7 @@ impl SoftPhone {
                             } else if *method == SipMethod::Notify {
                                 // NOTIFY for REFER status
                                 if let Some(body) = msg.body() {
-                                    println!("NOTIFY: {}", body.trim());
+                                    crate::ui::info(&format!("NOTIFY: {}", body.trim()));
                                 }
                                 if let SipMessage::Request(ref req) = msg {
                                     let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
@@ -700,47 +739,29 @@ impl SoftPhone {
                     }
                 }
 
-                // Interactive CLI commands from stdin
-                line = stdin_reader.next_line() => {
+                // Interactive CLI commands from line editor (supports history)
+                line = cmd_rx.recv() => {
                     match line {
-                        Ok(Some(input)) => {
+                        Some(input) => {
                             let parts: Vec<&str> = input.trim().split_whitespace().collect();
                             if parts.is_empty() { continue; }
 
                             match parts[0].to_lowercase().as_str() {
                                 "help" | "h" | "?" => {
-                                    println!("Commands:");
-                                    println!("  record <file.wav>  Start recording to WAV file");
-                                    println!("  stop               Stop recording");
-                                    println!("  mute               Mute outgoing audio");
-                                    println!("  unmute             Unmute outgoing audio");
-                                    println!("  stats              Show call statistics");
-                                    println!("  sniff              Start SIP packet tracing");
-                                    println!("  sniff verbose      Start with full headers/bodies");
-                                    println!("  sniff stop         Stop SIP packet tracing");
-                                    println!("  flows              Show call flow ladder diagrams");
-                                    println!("  dtmf <digits>      Queue DTMF over RTP (RFC2833)");
-                                    println!("  dtmf-info <digits> Queue DTMF over SIP INFO");
-                                    println!("  dtmf-send          Send queued DTMF digits now");
-                                    println!("  dtmf-queue         Show queued DTMF digits count");
-                                    println!("  hold               Put call on hold");
-                                    println!("  resume             Resume held call");
-                                    println!("  transfer <uri>     Blind transfer call (REFER)");
-                                    println!("  hangup | bye       End the call");
-                                    println!("  help               Show this help");
+                                    crate::ui::print_help();
                                 }
                                 "record" | "rec" => {
                                     if recorder.is_some() || live_recorder.is_some() {
                                         recording_active = true;
-                                        println!("Recording resumed.");
+                                        crate::ui::status("Recording resumed.");
                                     } else if parts.len() < 2 {
-                                        println!("Usage: record <filename.wav>");
+                                        crate::ui::warning("Usage: record <filename.wav>");
                                     } else {
                                         // Create a new recorder on the fly
                                         self.pending_record_path = Some(parts[1].to_string());
                                         live_recorder = Some(AudioRecorder::new(8000));
                                         recording_active = true;
-                                        println!("Recording to: {}", parts[1]);
+                                        crate::ui::status(&format!("Recording to: {}", parts[1]));
                                     }
                                 }
                                 "stop" => {
@@ -749,63 +770,52 @@ impl SoftPhone {
                                         let active_rec: Option<&AudioRecorder> = recorder.as_deref()
                                             .or(live_recorder.as_ref());
                                         if let Some(rec) = active_rec {
-                                            println!("Recording paused ({:.1}s captured, {} frames)",
-                                                rec.duration_ms() as f64 / 1000.0, rec.frame_count());
+                                            crate::ui::info(&format!("Recording paused ({:.1}s captured, {} frames)",
+                                                rec.duration_ms() as f64 / 1000.0, rec.frame_count()));
                                         }
                                     } else {
-                                        println!("Not recording.");
+                                        crate::ui::info("Not recording.");
                                     }
                                 }
                                 "mute" => {
                                     muted = true;
-                                    println!("Muted (outgoing audio silenced)");
+                                    crate::ui::warning("Muted (outgoing audio silenced)");
                                 }
                                 "unmute" => {
                                     muted = false;
-                                    println!("Unmuted");
+                                    crate::ui::status("Unmuted");
                                 }
                                 "stats" | "info" => {
                                     let elapsed = call_start.elapsed();
-                                    let mins = elapsed.as_secs() / 60;
-                                    let secs = elapsed.as_secs() % 60;
-                                    println!("--- Call Stats ---");
-                                    println!("  Duration:  {:02}:{:02}", mins, secs);
-                                    println!("  Muted:     {}", if muted { "yes" } else { "no" });
-                                    if let Some(ref rtp) = self.rtp_session {
-                                        let s = rtp.stats();
-                                        println!("  Codec:     {}", s.codec);
-                                        println!("  RTP local: {}", s.local_addr);
-                                        println!("  RTP remote:{}", s.remote_addr);
-                                        println!("  Packets TX:{}", s.packets_sent);
-                                        println!("  SSRC:      0x{:08X}", s.ssrc);
-                                    }
+                                    let rtp_stats = self.rtp_session.as_ref().map(|r| r.stats());
                                     let active_rec: Option<&AudioRecorder> = recorder.as_deref()
                                         .or(live_recorder.as_ref());
-                                    if let Some(rec) = active_rec {
-                                        println!("  Recording: {} ({:.1}s, {} frames)",
-                                            if recording_active { "active" } else { "paused" },
-                                            rec.duration_ms() as f64 / 1000.0, rec.frame_count());
-                                    }
-                                    println!("  Sniffing:  {} ({} messages)",
-                                        if debugger.is_active() { "active" } else { "off" },
-                                        debugger.message_count());
-                                    println!("------------------");
+                                    crate::ui::print_stats(
+                                        elapsed.as_secs(),
+                                        muted,
+                                        rtp_stats.as_ref(),
+                                        recording_active,
+                                        active_rec.map(|r| r.duration_ms()),
+                                        active_rec.map(|r| r.frame_count()),
+                                        debugger.is_active(),
+                                        debugger.message_count(),
+                                    );
                                 }
                                 "sniff" | "trace" | "debug" => {
                                     if parts.get(1).map(|s| s.to_lowercase()) == Some("stop".into()) {
                                         debugger.stop();
-                                        println!("SIP tracing stopped ({} messages captured).", debugger.message_count());
+                                        crate::ui::info(&format!("SIP tracing stopped ({} messages captured).", debugger.message_count()));
                                     } else {
                                         let verbose = parts.get(1).map(|s| s.to_lowercase()) == Some("verbose".into());
                                         debugger.start(verbose);
-                                        println!("SIP tracing started{}. All SIP messages will be displayed.",
-                                            if verbose { " (verbose)" } else { "" });
-                                        println!("  'sniff stop' to stop, 'flows' to show diagrams.");
+                                        crate::ui::status(&format!("SIP tracing started{}. All SIP messages will be displayed.",
+                                            if verbose { " (verbose)" } else { "" }));
+                                        crate::ui::info("  'sniff stop' to stop, 'flows' to show diagrams.");
                                     }
                                 }
                                 "flows" | "flow" | "ladder" => {
-                                    if debugger.message_count() == 0 {
-                                        println!("No SIP messages captured. Start tracing with 'sniff' first.");
+                                    if !debugger.has_captures() {
+                                        crate::ui::info("No SIP/RTP messages captured. Start tracing with 'sniff' first.");
                                     } else {
                                         debugger.print_summary();
                                         debugger.print_flows();
@@ -813,91 +823,144 @@ impl SoftPhone {
                                 }
                                 "dtmf" => {
                                     if parts.len() < 2 {
-                                        println!("Usage: dtmf <digits>");
+                                        crate::ui::warning("Usage: dtmf <digits>");
                                     } else {
                                         let queued = self.queue_dtmf_digits(parts[1], DtmfMethod::Rfc2833);
                                         if queued > 0 {
-                                            println!("Queued {} DTMF digit(s) for RTP RFC2833.", queued);
+                                            crate::ui::status(&format!("Queued {} DTMF digit(s) for RTP RFC2833.", queued));
                                         }
                                     }
                                 }
                                 "dtmf-info" | "dtmf_info" => {
                                     if parts.len() < 2 {
-                                        println!("Usage: dtmf-info <digits>");
+                                        crate::ui::warning("Usage: dtmf-info <digits>");
                                     } else {
                                         let queued = self.queue_dtmf_digits(parts[1], DtmfMethod::SipInfo);
                                         if queued > 0 {
-                                            println!("Queued {} DTMF digit(s) for SIP INFO.", queued);
+                                            crate::ui::status(&format!("Queued {} DTMF digit(s) for SIP INFO.", queued));
                                         }
                                     }
                                 }
                                 "dtmf-send" | "send-dtmf" => {
                                     let sent = self.flush_dtmf_queue(local_addr, &mut debugger).await?;
-                                    println!("Sent {} queued DTMF digit(s).", sent);
+                                    crate::ui::status(&format!("Sent {} queued DTMF digit(s).", sent));
                                 }
                                 "dtmf-queue" => {
-                                    println!("Queued DTMF digits: {}", self.dtmf_queue.len());
+                                    crate::ui::info(&format!("Queued DTMF digits: {}", self.dtmf_queue.len()));
                                 }
                                 "hold" => {
                                     if self.on_hold {
-                                        println!("Already on hold.");
+                                        crate::ui::info("Already on hold.");
                                     } else {
                                         match self.hold().await {
-                                            Ok(_) => println!("Call on hold (re-INVITE sent with a=sendonly)"),
-                                            Err(e) => println!("Hold failed: {}", e),
+                                            Ok(_) => crate::ui::warning("Call on hold (re-INVITE sent with a=sendonly)"),
+                                            Err(e) => crate::ui::error(&format!("Hold failed: {}", e)),
                                         }
                                     }
                                 }
                                 "resume" | "unhold" => {
                                     if !self.on_hold {
-                                        println!("Call is not on hold.");
+                                        crate::ui::info("Call is not on hold.");
                                     } else {
                                         match self.resume().await {
-                                            Ok(_) => println!("Call resumed (re-INVITE sent with a=sendrecv)"),
-                                            Err(e) => println!("Resume failed: {}", e),
+                                            Ok(_) => crate::ui::success("Call resumed (re-INVITE sent with a=sendrecv)"),
+                                            Err(e) => crate::ui::error(&format!("Resume failed: {}", e)),
                                         }
                                     }
                                 }
                                 "transfer" | "xfer" | "refer" => {
                                     if parts.len() < 2 {
-                                        println!("Usage: transfer <sip:user@host>");
+                                        crate::ui::warning("Usage: transfer <sip:user@host>");
                                     } else {
                                         match self.transfer(parts[1]).await {
-                                            Ok(_) => println!("REFER sent to transfer call to {}", parts[1]),
-                                            Err(e) => println!("Transfer failed: {}", e),
+                                            Ok(_) => crate::ui::status(&format!("REFER sent to transfer call to {}", parts[1])),
+                                            Err(e) => crate::ui::error(&format!("Transfer failed: {}", e)),
                                         }
                                     }
                                 }
                                 "hangup" | "bye" | "quit" | "exit" | "q" => {
-                                    println!("Hanging up...");
-                                    // Capture outgoing BYE if sniffing
-                                    if debugger.is_active() {
-                                        if let Some(ref dialog) = self.dialog {
-                                            let cseq = dialog.local_cseq + 1;
-                                            let bye_msg = build_in_dialog_request(SipMethod::Bye, dialog, &local_addr, cseq);
-                                            let bye_dest = dialog.remote_target.as_deref()
-                                                .and_then(sip_core::transport::resolve_sip_uri)
-                                                .or(self.remote_sip_addr);
-                                            if let Some(addr) = bye_dest {
-                                                debugger.capture_outgoing(&bye_msg, local_addr, addr);
-                                            }
+                                    crate::ui::info("Hanging up...");
+                                    let (bye_msg, bye_dest, bye_cseq) = if let Some(dialog) = self.dialog.as_mut() {
+                                        let cseq = dialog.next_cseq();
+                                        let msg = build_in_dialog_request(SipMethod::Bye, dialog, &local_addr, cseq);
+                                        let dest = dialog
+                                            .remote_target
+                                            .as_deref()
+                                            .and_then(sip_core::transport::resolve_sip_uri)
+                                            .or(self.remote_sip_addr);
+                                        (msg, dest, cseq)
+                                    } else {
+                                        crate::ui::warning("No active dialog to hang up.");
+                                        break;
+                                    };
+
+                                    if let Some(addr) = bye_dest {
+                                        if debugger.is_active() {
+                                            debugger.capture_outgoing(&bye_msg, local_addr, addr);
                                         }
+                                        self.transport.send_to(&bye_msg, addr).await?;
+                                        crate::ui::info("Waiting up to 3s for BYE response...");
+
+                                        let bye_result = tokio::time::timeout(
+                                            std::time::Duration::from_secs(3),
+                                            async {
+                                                loop {
+                                                    let Some(incoming) = rx.recv().await else {
+                                                        return None;
+                                                    };
+                                                    debugger.capture_incoming(
+                                                        &incoming.message,
+                                                        incoming.source,
+                                                        local_addr,
+                                                    );
+                                                    if incoming.message.is_response() {
+                                                        if let Some((cseq, method)) = incoming.message.cseq() {
+                                                            if method == SipMethod::Bye && cseq == bye_cseq {
+                                                                return Some(
+                                                                    incoming
+                                                                        .message
+                                                                        .status()
+                                                                        .map(|s| s.is_success())
+                                                                        .unwrap_or(false),
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        .await;
+
+                                        match bye_result {
+                                            Ok(Some(true)) => crate::ui::success("Hangup acknowledged (200 OK)."),
+                                            Ok(Some(false)) => crate::ui::warning(
+                                                "Received non-200 response to BYE; ending call.",
+                                            ),
+                                            Ok(None) | Err(_) => crate::ui::warning(
+                                                "No BYE response within 3 seconds; ending call.",
+                                            ),
+                                        }
+                                    } else {
+                                        crate::ui::warning("No remote SIP address for BYE; ending locally.");
                                     }
-                                    self.hangup().await?;
+
+                                    if let Some(dialog) = self.dialog.as_mut() {
+                                        dialog.terminate();
+                                    }
+                                    self.rtp_session = None;
                                     // Print final flows if we were sniffing
-                                    if debugger.message_count() > 0 {
+                                    if debugger.has_captures() {
                                         debugger.print_summary();
                                         debugger.print_flows();
                                     }
                                     break;
                                 }
                                 _ => {
-                                    println!("Unknown command '{}'. Type 'help' for commands.", parts[0]);
+                                    crate::ui::warning(&format!("Unknown command '{}'. Type 'help' for commands.", parts[0]));
                                 }
                             }
                         }
-                        Ok(None) => break, // EOF
-                        Err(_) => {} // ignore stdin errors
+                        None => break, // input reader ended
                     }
                 }
 
@@ -925,12 +988,20 @@ impl SoftPhone {
                             if !announced_audio_tx && sent > 0 {
                                 let s = rtp.stats();
                                 let codec = s.codec;
-                                println!(
+                                crate::ui::status(&format!(
                                     "Audio TX active: codec={} PT={} rate={}Hz",
                                     codec,
                                     codec.payload_type(),
                                     codec.clock_rate()
-                                );
+                                ));
+                                    if let Some(call_id) = self.active_call_id() {
+                                        debugger.capture_rtp_event(
+                                            &call_id,
+                                            s.local_addr,
+                                            s.remote_addr,
+                                            "RTP audio flow active (TX)",
+                                        );
+                                    }
                                 announced_audio_tx = true;
                             }
                         }
@@ -944,6 +1015,7 @@ impl SoftPhone {
         if let Some(stop) = rtp_stop_tx {
             let _ = stop.send(()).await;
         }
+        let _ = cmd_stop_tx.send(());
 
         self.live_recorder = live_recorder;
 
@@ -972,7 +1044,7 @@ impl SoftPhone {
                 });
                 count += 1;
             } else {
-                println!("Ignoring unsupported DTMF digit '{}'", ch);
+                crate::ui::warning(&format!("Ignoring unsupported DTMF digit '{}'", ch));
             }
         }
         count
@@ -995,9 +1067,9 @@ impl SoftPhone {
                     };
                     let payload_type = self.remote_dtmf_payload_type.unwrap_or(self.local_dtmf_payload_type);
                     if let Err(e) = rtp.send_rfc2833_digit(item.digit, payload_type).await {
-                        println!("Failed to send RTP DTMF '{}': {}", item.digit, e);
+                        crate::ui::error(&format!("Failed to send RTP DTMF '{}': {}", item.digit, e));
                     } else {
-                        println!("DTMF sent (RTP RFC2833): {}", item.digit);
+                        crate::ui::event(&format!("DTMF sent (RTP RFC2833): {}", item.digit));
                         sent += 1;
                     }
                 }
@@ -1006,7 +1078,7 @@ impl SoftPhone {
                         if let Some(target) = self.remote_sip_addr {
                             debugger.capture_outgoing(&info, local_addr, target);
                             self.transport.send_to(&info, target).await?;
-                            println!("DTMF sent (SIP INFO): {}", item.digit);
+                            crate::ui::event(&format!("DTMF sent (SIP INFO): {}", item.digit));
                             sent += 1;
                         }
                     }
@@ -1369,7 +1441,7 @@ fn build_ack_msg(dialog: &SipDialog, local_addr: &SocketAddr) -> SipMessage {
     build_in_dialog_request(SipMethod::Ack, dialog, local_addr, 1)
 }
 
-fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
+async fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
     // Strip sip: prefix
     let addr_str = server
         .strip_prefix("sip:")
@@ -1403,20 +1475,25 @@ fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
 
     // Try SRV lookup: _sip._udp.<hostname>
     if explicit_port.is_none() {
-        if let Some(addr) = resolve_srv(hostname) {
+        if let Some(addr) = resolve_srv(hostname).await {
             return Ok(addr);
         }
     }
 
-    // Fall back to standard DNS A/AAAA resolution
+    // Fall back to standard DNS A/AAAA resolution, preferring IPv4
     use std::net::ToSocketAddrs;
     let addr_with_port = if let Some(port) = explicit_port {
         format!("{}:{}", hostname, port)
     } else {
         format!("{}:5060", hostname)
     };
-    if let Ok(mut addrs) = addr_with_port.to_socket_addrs() {
-        if let Some(addr) = addrs.next() {
+    if let Ok(addrs) = addr_with_port.to_socket_addrs() {
+        let all: Vec<_> = addrs.collect();
+        // Prefer IPv4 since we bind to 0.0.0.0
+        if let Some(addr) = all.iter().find(|a| a.is_ipv4()) {
+            return Ok(*addr);
+        }
+        if let Some(addr) = all.into_iter().next() {
             return Ok(addr);
         }
     }
@@ -1428,14 +1505,14 @@ fn resolve_server_addr(server: &str) -> Result<SocketAddr, PhoneError> {
 }
 
 /// Try DNS SRV resolution for _sip._udp.<hostname>
-fn resolve_srv(hostname: &str) -> Option<SocketAddr> {
-    use hickory_resolver::Resolver;
+async fn resolve_srv(hostname: &str) -> Option<SocketAddr> {
+    use hickory_resolver::TokioAsyncResolver;
     use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 
-    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).ok()?;
+    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
     let srv_name = format!("_sip._udp.{}", hostname);
 
-    let lookup = resolver.srv_lookup(&srv_name).ok()?;
+    let lookup = resolver.srv_lookup(&srv_name).await.ok()?;
 
     // Sort by priority (lower = better), then by weight
     let mut records: Vec<_> = lookup.iter().collect();
@@ -1450,11 +1527,13 @@ fn resolve_srv(hostname: &str) -> Option<SocketAddr> {
         let port = record.port();
 
         // Resolve the SRV target to an IP
-        use std::net::ToSocketAddrs;
-        let addr_str = format!("{}:{}", target, port);
-        if let Ok(mut addrs) = addr_str.to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
-                return Some(addr);
+        if let Ok(ip_lookup) = resolver.lookup_ip(target).await {
+            let ips: Vec<_> = ip_lookup.iter().collect();
+            if let Some(ip) = ips.iter().find(|ip| ip.is_ipv4()) {
+                return Some(SocketAddr::new(*ip, port));
+            }
+            if let Some(ip) = ips.into_iter().next() {
+                return Some(SocketAddr::new(ip, port));
             }
         }
     }
@@ -1493,37 +1572,292 @@ fn parse_info_dtmf(body: Option<&str>) -> Option<(char, u16)> {
     signal.map(|d| (d, duration.unwrap_or(160)))
 }
 
+fn history_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".sipr.history"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".sipr.history"))
+}
+
+fn load_history_from_path(path: &std::path::Path, max_history: usize) -> Vec<String> {
+    let mut history = match std::fs::read_to_string(path) {
+        Ok(contents) => contents
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if history.len() > max_history {
+        let keep_from = history.len() - max_history;
+        history = history.split_off(keep_from);
+    }
+    history
+}
+
+fn load_history(max_history: usize) -> Vec<String> {
+    let path = history_path();
+    load_history_from_path(&path, max_history)
+}
+
+fn save_history_to_path(path: &std::path::Path, history: &[String], max_history: usize) {
+    let keep_from = history.len().saturating_sub(max_history);
+    let kept = &history[keep_from..];
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::File::create(path) {
+        for entry in kept {
+            let _ = writeln!(file, "{entry}");
+        }
+    }
+}
+
+fn save_history(history: &[String], max_history: usize) {
+    let path = history_path();
+    save_history_to_path(&path, history, max_history);
+}
+
+fn push_history_entry(history: &mut Vec<String>, line: &str, max_history: usize) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let is_dup = history.last().map(|h| h == trimmed).unwrap_or(false);
+    if is_dup {
+        return false;
+    }
+    history.push(trimmed.to_string());
+    if history.len() > max_history {
+        let keep_from = history.len() - max_history;
+        *history = history.split_off(keep_from);
+    }
+    true
+}
+
+fn is_ctrl_char(key: &KeyEvent, ch: char, ctrl_code: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&ch))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        || matches!(key.code, KeyCode::Char(c) if c == ctrl_code)
+}
+
+fn find_reverse_history_match(
+    history: &[String],
+    query: &str,
+    start_before: Option<usize>,
+) -> Option<usize> {
+    if query.is_empty() {
+        return history.len().checked_sub(1);
+    }
+    let mut idx = start_before.unwrap_or(history.len());
+    while idx > 0 {
+        idx -= 1;
+        if history[idx].contains(query) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn start_interactive_command_reader(max_history: usize) -> (tokio::sync::mpsc::Receiver<String>, std::sync::mpsc::Sender<()>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+    std::thread::spawn(move || {
+        let mut history = load_history(max_history);
+        let mut hist_pos: Option<usize> = None;
+        let mut current = String::new();
+        let mut search_mode = false;
+        let mut search_query = String::new();
+        let mut search_match_idx: Option<usize> = None;
+        let mut search_original = String::new();
+        let _ = enable_raw_mode();
+        crate::ui::prompt();
+
+        let redraw = |line: &str| {
+            print!("\r\x1b[2K");
+            crate::ui::prompt();
+            print!("{line}");
+            let _ = std::io::stdout().flush();
+        };
+
+        let redraw_search = |query: &str, current_match: Option<&str>| {
+            print!("\r\x1b[2K");
+            let shown = current_match.unwrap_or("");
+            print!("(reverse-i-search)`{query}`: {shown}");
+            let _ = std::io::stdout().flush();
+        };
+
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            if !event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                continue;
+            }
+            let Ok(ev) = event::read() else { continue };
+            if let Event::Key(key) = ev {
+                // Ignore key-release events to avoid duplicate chars and prompt drift.
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if search_mode {
+                    match key.code {
+                        KeyCode::Esc => {
+                            search_mode = false;
+                            current = search_original.clone();
+                            redraw(&current);
+                        }
+                        _ if is_ctrl_char(&key, 'g', '\u{7}') => {
+                            search_mode = false;
+                            current = search_original.clone();
+                            redraw(&current);
+                        }
+                        KeyCode::Enter => {
+                            if let Some(idx) = search_match_idx {
+                                current = history[idx].clone();
+                                hist_pos = Some(idx);
+                            } else {
+                                current = search_original.clone();
+                                hist_pos = None;
+                            }
+                            search_mode = false;
+                            redraw(&current);
+                        }
+                        KeyCode::Backspace => {
+                            search_query.pop();
+                            search_match_idx = find_reverse_history_match(&history, &search_query, None);
+                            let matched = search_match_idx.map(|i| history[i].as_str());
+                            redraw_search(&search_query, matched);
+                        }
+                        _ if is_ctrl_char(&key, 'r', '\u{12}') => {
+                            let start_before = search_match_idx;
+                            search_match_idx = find_reverse_history_match(&history, &search_query, start_before);
+                            let matched = search_match_idx.map(|i| history[i].as_str());
+                            redraw_search(&search_query, matched);
+                        }
+                        KeyCode::Char(ch) => {
+                            search_query.push(ch);
+                            search_match_idx = find_reverse_history_match(&history, &search_query, None);
+                            let matched = search_match_idx.map(|i| history[i].as_str());
+                            redraw_search(&search_query, matched);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                match key.code {
+                    _ if is_ctrl_char(&key, 'c', '\u{3}') => {
+                        let _ = tx.blocking_send("hangup".to_string());
+                        break;
+                    }
+                    _ if is_ctrl_char(&key, 'r', '\u{12}') => {
+                        search_mode = true;
+                        search_query.clear();
+                        search_match_idx = find_reverse_history_match(&history, "", None);
+                        search_original = current.clone();
+                        let matched = search_match_idx.map(|i| history[i].as_str());
+                        redraw_search(&search_query, matched);
+                    }
+                    KeyCode::Enter => {
+                        print!("\r\n");
+                        let _ = std::io::stdout().flush();
+                        let line = current.trim().to_string();
+                        if !line.is_empty() {
+                            if push_history_entry(&mut history, &line, max_history) {
+                                save_history(&history, max_history);
+                            }
+                            let _ = tx.blocking_send(line);
+                        }
+                        current.clear();
+                        hist_pos = None;
+                        crate::ui::prompt();
+                    }
+                    KeyCode::Backspace => {
+                        if !current.is_empty() {
+                            current.pop();
+                            redraw(&current);
+                        }
+                    }
+                    KeyCode::Up => {
+                        if history.is_empty() {
+                            continue;
+                        }
+                        hist_pos = Some(match hist_pos {
+                            None => history.len() - 1,
+                            Some(pos) => pos.saturating_sub(1),
+                        });
+                        if let Some(pos) = hist_pos {
+                            current = history[pos].clone();
+                            redraw(&current);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if history.is_empty() {
+                            continue;
+                        }
+                        match hist_pos {
+                            Some(pos) if pos + 1 < history.len() => {
+                                hist_pos = Some(pos + 1);
+                                current = history[pos + 1].clone();
+                            }
+                            _ => {
+                                hist_pos = None;
+                                current.clear();
+                            }
+                        }
+                        redraw(&current);
+                    }
+                    KeyCode::Char(ch) => {
+                        current.push(ch);
+                        print!("{ch}");
+                        let _ = std::io::stdout().flush();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let _ = disable_raw_mode();
+        print!("\r\n");
+        let _ = std::io::stdout().flush();
+    });
+
+    (rx, stop_tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_resolve_server_addr() {
-        let addr = resolve_server_addr("192.168.1.1:5060").unwrap();
+    #[tokio::test]
+    async fn test_resolve_server_addr() {
+        let addr = resolve_server_addr("192.168.1.1:5060").await.unwrap();
         assert_eq!(addr.to_string(), "192.168.1.1:5060");
 
-        let addr = resolve_server_addr("192.168.1.1").unwrap();
+        let addr = resolve_server_addr("192.168.1.1").await.unwrap();
         assert_eq!(addr.to_string(), "192.168.1.1:5060");
 
-        let addr = resolve_server_addr("sip:192.168.1.1:5060").unwrap();
+        let addr = resolve_server_addr("sip:192.168.1.1:5060").await.unwrap();
         assert_eq!(addr.to_string(), "192.168.1.1:5060");
 
-        let addr = resolve_server_addr("sip:10.0.0.1").unwrap();
+        let addr = resolve_server_addr("sip:10.0.0.1").await.unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5060");
     }
 
-    #[test]
-    fn test_resolve_server_addr_invalid() {
-        assert!(resolve_server_addr("not-a-valid-address").is_err());
+    #[tokio::test]
+    async fn test_resolve_server_addr_invalid() {
+        assert!(resolve_server_addr("not-a-valid-address").await.is_err());
     }
 
-    #[test]
-    fn test_resolve_server_addr_ip_passthrough() {
+    #[tokio::test]
+    async fn test_resolve_server_addr_ip_passthrough() {
         // IP addresses should bypass SRV lookup
-        let addr = resolve_server_addr("192.168.1.1:5060").unwrap();
+        let addr = resolve_server_addr("192.168.1.1:5060").await.unwrap();
         assert_eq!(addr.to_string(), "192.168.1.1:5060");
 
-        let addr = resolve_server_addr("192.168.1.1").unwrap();
+        let addr = resolve_server_addr("192.168.1.1").await.unwrap();
         assert_eq!(addr.port(), 5060);
     }
 
@@ -1561,6 +1895,104 @@ mod tests {
         assert!(is_valid_dtmf_digit('D'));
         assert!(is_valid_dtmf_digit('a'));
         assert!(!is_valid_dtmf_digit('Z'));
+    }
+
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        p.push(format!("sipr-{prefix}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_load_history_from_path_trims_to_max() {
+        let dir = unique_test_dir("history-load");
+        let path = dir.join(".sipr.history");
+        std::fs::write(&path, "cmd1\ncmd2\ncmd3\ncmd4\ncmd5\n").unwrap();
+
+        let loaded = load_history_from_path(&path, 3);
+        assert_eq!(loaded, vec!["cmd3", "cmd4", "cmd5"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_save_history_to_path_keeps_latest_max() {
+        let dir = unique_test_dir("history-save");
+        let path = dir.join(".sipr.history");
+        let history = vec![
+            "one".to_string(),
+            "two".to_string(),
+            "three".to_string(),
+            "four".to_string(),
+        ];
+
+        save_history_to_path(&path, &history, 2);
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(persisted, "three\nfour\n");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_find_reverse_history_match_empty_query_returns_latest() {
+        let history = vec![
+            "register".to_string(),
+            "dtmf 1".to_string(),
+            "hangup".to_string(),
+        ];
+        assert_eq!(find_reverse_history_match(&history, "", None), Some(2));
+    }
+
+    #[test]
+    fn test_find_reverse_history_match_respects_start_before() {
+        let history = vec![
+            "dtmf 1".to_string(),
+            "call sip:bob@example.com".to_string(),
+            "dtmf 2".to_string(),
+            "dtmf 3".to_string(),
+        ];
+
+        // Latest match first.
+        let first = find_reverse_history_match(&history, "dtmf", None);
+        assert_eq!(first, Some(3));
+
+        // Ctrl+R again should find older one.
+        let second = find_reverse_history_match(&history, "dtmf", first);
+        assert_eq!(second, Some(2));
+
+        // And one more.
+        let third = find_reverse_history_match(&history, "dtmf", second);
+        assert_eq!(third, Some(0));
+    }
+
+    #[test]
+    fn test_push_history_entry_skips_consecutive_duplicates_and_caps() {
+        let mut history = vec!["call sip:alice@example.com".to_string()];
+
+        // Duplicate of last command should be ignored.
+        assert!(!push_history_entry(
+            &mut history,
+            "call sip:alice@example.com",
+            3
+        ));
+        assert_eq!(history, vec!["call sip:alice@example.com"]);
+
+        // New command should be added.
+        assert!(push_history_entry(&mut history, "dtmf 1", 3));
+        assert_eq!(
+            history,
+            vec!["call sip:alice@example.com", "dtmf 1"]
+        );
+
+        // Add more commands to exceed cap and ensure oldest is dropped.
+        assert!(push_history_entry(&mut history, "dtmf 2", 3));
+        assert!(push_history_entry(&mut history, "hangup", 3));
+        assert_eq!(history, vec!["dtmf 1", "dtmf 2", "hangup"]);
     }
 
     #[tokio::test]
@@ -1633,6 +2065,8 @@ mod tests {
                 "sip:bob@example.com",
                 Some(&server_addr.to_string()),
                 Some("alice"),
+                None,
+                CodecType::Pcmu,
             )
             .await
             .unwrap();
@@ -1672,7 +2106,10 @@ mod tests {
 
         // Call with server extracted from URI
         let uri = format!("sip:bob@{}", server_addr);
-        phone.call(&uri, None, Some("alice")).await.unwrap();
+        phone
+            .call(&uri, None, Some("alice"), None, CodecType::Pcmu)
+            .await
+            .unwrap();
 
         assert!(phone.dialog().is_some());
     }
@@ -1684,8 +2121,34 @@ mod tests {
         let server_addr = server_socket.local_addr().unwrap();
 
         let uri = format!("sip:bob@{}", server_addr);
-        phone.call(&uri, None, None).await.unwrap();
+        phone
+            .call(&uri, None, None, None, CodecType::Pcmu)
+            .await
+            .unwrap();
         assert!(phone.dialog().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_softphone_call_derives_auth_user_when_password_provided() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let uri = format!("sip:bob@{}", server_addr);
+        phone
+            .call(
+                &uri,
+                None,
+                None,
+                Some("secret"),
+                CodecType::Pcmu,
+            )
+            .await
+            .unwrap();
+
+        let creds = phone.credentials.as_ref().expect("credentials should be set");
+        assert_eq!(creds.username, "bob");
+        assert_eq!(creds.password, "secret");
     }
 
     #[tokio::test]
@@ -1703,7 +2166,13 @@ mod tests {
         let rtp_source_addr = rtp_source.local_addr().unwrap();
 
         phone
-            .call("sip:bob@example.com", Some(&sip_addr.to_string()), Some("alice"))
+            .call(
+                "sip:bob@example.com",
+                Some(&sip_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
             .await
             .unwrap();
 
@@ -1827,7 +2296,13 @@ Content-Length: 0\r\n\
         let rtp_source_addr = rtp_source.local_addr().unwrap();
 
         phone
-            .call("sip:bob@example.com", Some(&sip_addr.to_string()), Some("alice"))
+            .call(
+                "sip:bob@example.com",
+                Some(&sip_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
             .await
             .unwrap();
 
@@ -1994,7 +2469,16 @@ Content-Length: 0\r\n\
         let server_addr = server_socket.local_addr().unwrap();
 
         // Establish a call first
-        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+        phone
+            .call(
+                "sip:bob@example.com",
+                Some(&server_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
+            .await
+            .unwrap();
 
         // Drain the INVITE from server
         let mut buf = vec![0u8; 65535];
@@ -2034,7 +2518,16 @@ Content-Length: 0\r\n\
         let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
 
-        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+        phone
+            .call(
+                "sip:bob@example.com",
+                Some(&server_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 65535];
         let _ = tokio::time::timeout(
@@ -2085,7 +2578,16 @@ Content-Length: 0\r\n\
         let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
 
-        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+        phone
+            .call(
+                "sip:bob@example.com",
+                Some(&server_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 65535];
         let _ = tokio::time::timeout(
@@ -2122,7 +2624,16 @@ Content-Length: 0\r\n\
         let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
 
-        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+        phone
+            .call(
+                "sip:bob@example.com",
+                Some(&server_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 65535];
         let _ = tokio::time::timeout(
@@ -2160,7 +2671,16 @@ Content-Length: 0\r\n\
         let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
 
-        phone.call("sip:bob@example.com", Some(&server_addr.to_string()), Some("alice")).await.unwrap();
+        phone
+            .call(
+                "sip:bob@example.com",
+                Some(&server_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::Pcmu,
+            )
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 65535];
         let _ = tokio::time::timeout(
@@ -2286,23 +2806,23 @@ a=sendrecv\r\n",
 
     // ── DNS SRV Resolution Tests ──────────────────────────
 
-    #[test]
-    fn test_resolve_srv_invalid_domain() {
+    #[tokio::test]
+    async fn test_resolve_srv_invalid_domain() {
         // SRV lookup for nonexistent domain should return None
-        let result = resolve_srv("nonexistent.invalid.example.test");
+        let result = resolve_srv("nonexistent.invalid.example.test").await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn test_resolve_server_addr_with_explicit_port_skips_srv() {
+    #[tokio::test]
+    async fn test_resolve_server_addr_with_explicit_port_skips_srv() {
         // When port is explicit, SRV should be skipped
-        let addr = resolve_server_addr("192.168.1.1:5080").unwrap();
+        let addr = resolve_server_addr("192.168.1.1:5080").await.unwrap();
         assert_eq!(addr.port(), 5080);
     }
 
-    #[test]
-    fn test_resolve_server_addr_sip_prefix_stripped() {
-        let addr = resolve_server_addr("sip:10.0.0.1:5070").unwrap();
+    #[tokio::test]
+    async fn test_resolve_server_addr_sip_prefix_stripped() {
+        let addr = resolve_server_addr("sip:10.0.0.1:5070").await.unwrap();
         assert_eq!(addr.to_string(), "10.0.0.1:5070");
     }
 

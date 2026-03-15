@@ -24,7 +24,11 @@ uuid = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 chrono = "0.4"
+crossterm = "0.28"
+dirs = "5"
 hickory-resolver = "0.24"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -8,6 +8,8 @@ use sip_core::message::{SipMessage, SipMethod};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
+use crate::ui;
+
 /// A captured SIP message with metadata
 #[derive(Debug, Clone)]
 pub struct CapturedMessage {
@@ -19,7 +21,7 @@ pub struct CapturedMessage {
 }
 
 impl CapturedMessage {
-    /// One-line summary for the message list view
+    /// One-line summary for the message list view (plain text for tests)
     pub fn summary(&self) -> String {
         let direction = format!("{} → {}", self.source, self.destination);
         let desc = match &self.message {
@@ -33,7 +35,17 @@ impl CapturedMessage {
         format!("{} | {:42} | {} ({}B)", self.timestamp, direction, desc, self.raw_size)
     }
 
-    /// Full formatted display of the SIP message with all headers
+    /// Colored one-line summary
+    pub fn summary_colored(&self) -> String {
+        ui::sip_summary(&self.timestamp, &self.source, &self.destination, &self.message, self.raw_size)
+    }
+
+    /// Colored full detail display
+    pub fn detail_colored(&self) -> String {
+        ui::sip_detail(&self.timestamp, &self.source, &self.destination, &self.message, self.raw_size)
+    }
+
+    /// Full formatted display of the SIP message with all headers (plain text for tests)
     pub fn detail(&self) -> String {
         let mut out = String::new();
 
@@ -75,11 +87,21 @@ impl CapturedMessage {
     }
 }
 
+/// A captured RTP/media flow event tied to a call
+#[derive(Debug, Clone)]
+pub struct CapturedMediaEvent {
+    pub timestamp: String,
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub label: String,
+}
+
 /// A call flow identified by Call-ID
 #[derive(Debug, Clone)]
 pub struct CallFlow {
     pub call_id: String,
     pub messages: Vec<CapturedMessage>,
+    pub media_events: Vec<CapturedMediaEvent>,
 }
 
 impl CallFlow {
@@ -87,10 +109,11 @@ impl CallFlow {
         Self {
             call_id,
             messages: Vec::new(),
+            media_events: Vec::new(),
         }
     }
 
-    /// Render an ASCII call flow diagram (ladder diagram)
+    /// Render an ASCII call flow diagram (ladder diagram) — plain text for tests
     pub fn ladder_diagram(&self) -> String {
         if self.messages.is_empty() {
             return String::from("(no messages)");
@@ -193,6 +216,11 @@ impl CallFlow {
 
         out
     }
+
+    /// Render a colored call flow diagram
+    pub fn ladder_diagram_colored(&self) -> String {
+        ui::ladder_diagram(&self.call_id, &self.messages)
+    }
 }
 
 /// SIP traffic sniffer/debugger
@@ -230,7 +258,6 @@ impl SipDebugger {
     }
 
     /// Capture a SIP message from the call's transport layer.
-    /// Called from `run_call` for every incoming SIP message.
     pub fn capture_incoming(&mut self, message: &SipMessage, source: SocketAddr, local_addr: SocketAddr) {
         if !self.active {
             return;
@@ -266,12 +293,14 @@ impl SipDebugger {
 
     /// Process a captured SIP message
     pub fn process(&mut self, msg: CapturedMessage) {
-        // Print summary line
-        println!("{}", msg.summary());
+        ui::clear_current_line();
+        // Print colored summary
+        ui::print_line(&msg.summary_colored());
 
         // Print full detail in verbose mode
         if self.verbose {
-            println!("{}", msg.detail());
+            ui::clear_current_line();
+            ui::print_block(&msg.detail_colored());
         }
 
         // Track by call-id
@@ -288,29 +317,77 @@ impl SipDebugger {
         self.messages.push(msg);
     }
 
-    /// Print call flow diagrams for all tracked calls
-    pub fn print_flows(&self) {
-        if self.calls.is_empty() {
-            println!("No calls captured.");
+    /// Capture RTP/media flow information (early media and connected call media)
+    pub fn capture_rtp_event(
+        &mut self,
+        call_id: &str,
+        source: SocketAddr,
+        destination: SocketAddr,
+        label: &str,
+    ) {
+        if !self.active {
             return;
         }
-        for flow in &self.calls {
-            println!("\n{}", flow.ladder_diagram());
+
+        let event = CapturedMediaEvent {
+            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+            source,
+            destination,
+            label: label.to_string(),
+        };
+
+        ui::print_line(&ui::media_flow_summary(
+            &event.timestamp,
+            &event.source,
+            &event.destination,
+            &event.label,
+        ));
+
+        if let Some(flow) = self.calls.iter_mut().find(|f| f.call_id == call_id) {
+            flow.media_events.push(event);
+        } else {
+            let mut flow = CallFlow::new(call_id.to_string());
+            flow.media_events.push(event);
+            self.calls.push(flow);
         }
     }
 
-    /// Print a summary table
-    pub fn print_summary(&self) {
-        println!("\n═══ Capture Summary ═══");
-        println!("Total messages: {}", self.messages.len());
-        println!("Active calls:   {}", self.calls.len());
+    /// Print colored call flow diagrams for all tracked calls
+    pub fn print_flows(&self) {
+        if self.calls.is_empty() {
+            ui::clear_current_line();
+            ui::print_line("No calls captured.");
+            return;
+        }
+        for flow in &self.calls {
+            ui::clear_current_line();
+            if !flow.messages.is_empty() {
+                ui::print_block(&format!("\n{}", flow.ladder_diagram_colored()));
+            } else {
+                ui::print_block(&format!("\nCall-ID: {}", flow.call_id));
+            }
+            if !flow.media_events.is_empty() {
+                ui::print_line("RTP/media flow:");
+                for ev in &flow.media_events {
+                    ui::print_line(&format!(
+                        "  {}",
+                        ui::media_flow_summary(
+                            &ev.timestamp,
+                            &ev.source,
+                            &ev.destination,
+                            &ev.label,
+                        )
+                    ));
+                }
+            }
+        }
+    }
 
+    /// Print a colored summary table
+    pub fn print_summary(&self) {
         let requests = self.messages.iter().filter(|m| m.message.is_request()).count();
         let responses = self.messages.iter().filter(|m| m.message.is_response()).count();
-        println!("Requests:       {}", requests);
-        println!("Responses:      {}", responses);
 
-        // Method breakdown
         let mut methods: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for msg in &self.messages {
             let key = match &msg.message {
@@ -320,17 +397,31 @@ impl SipDebugger {
             *methods.entry(key).or_insert(0) += 1;
         }
 
-        println!("\nBreakdown:");
         let mut sorted: Vec<_> = methods.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        for (method, count) in sorted {
-            println!("  {:30} {}", method, count);
-        }
+
+        ui::print_capture_summary(
+            self.messages.len(),
+            self.calls.len(),
+            requests,
+            responses,
+            &sorted,
+        );
     }
 
     /// Total captured messages count
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    /// Total captured RTP/media events count
+    pub fn media_event_count(&self) -> usize {
+        self.calls.iter().map(|c| c.media_events.len()).sum()
+    }
+
+    /// True if any SIP or RTP/media capture exists
+    pub fn has_captures(&self) -> bool {
+        self.message_count() > 0 || self.media_event_count() > 0
     }
 }
 
@@ -344,18 +435,11 @@ pub async fn run_sniffer(
     let socket = UdpSocket::bind(&bind_addr).await?;
     let local_addr = socket.local_addr()?;
 
-    println!("╔════════════════════════════════════════════════════╗");
-    println!("║           siphone SIP Debugger / Sniffer          ║");
-    println!("╟────────────────────────────────────────────────────╢");
-    println!("║ Listening on: {:37} ║", local_addr);
-    println!("║ Mode:         {:37} ║",
-        if verbose { "verbose (full headers)" } else { "summary" }
+    ui::print_sniffer_header(
+        &local_addr,
+        verbose,
+        filter_method.as_ref().map(|m| m.as_str()),
     );
-    if let Some(ref method) = filter_method {
-        println!("║ Filter:       {:37} ║", method);
-    }
-    println!("║ Press Ctrl+C to stop and show call flows          ║");
-    println!("╚════════════════════════════════════════════════════╝\n");
 
     let mut debugger = SipDebugger::new(verbose);
     let mut buf = vec![0u8; 65535];
@@ -404,15 +488,15 @@ pub async fn run_sniffer(
                             Err(_) => {
                                 // Not a SIP message, show as unknown if verbose
                                 if verbose {
-                                    println!("[{}] Non-SIP: {} bytes from {}",
+                                    ui::info(&format!("[{}] Non-SIP: {} bytes from {}",
                                         Local::now().format("%H:%M:%S%.3f"),
-                                        len, source);
+                                        len, source));
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Receive error: {}", e);
+                        ui::error(&format!("Receive error: {}", e));
                         break;
                     }
                 }
