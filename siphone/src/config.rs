@@ -4,6 +4,7 @@
 //! CLI flags always override config file values.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Persistent configuration for sipr.
@@ -35,6 +36,8 @@ pub struct SiprConfig {
     pub record_path: Option<String>,
     /// Maximum number of command history entries to keep in ~/.sipr.history
     pub max_history: Option<usize>,
+    /// Speed dial slots (0-9) mapped to SIP URIs
+    pub speed_dials: Option<BTreeMap<String, String>>,
 }
 
 impl SiprConfig {
@@ -92,6 +95,10 @@ impl SiprConfig {
             sniff: Some(false),
             record_path: None,
             max_history: Some(1000),
+            speed_dials: Some(BTreeMap::from([
+                ("1".to_string(), "sip:alice@example.com".to_string()),
+                ("2".to_string(), "sip:bob@example.com".to_string()),
+            ])),
         };
         serde_json::to_string_pretty(&example).unwrap()
     }
@@ -99,6 +106,18 @@ impl SiprConfig {
     /// Find which config file is currently active (first that exists).
     pub fn active_path() -> Option<PathBuf> {
         Self::config_paths().into_iter().find(|p| p.exists())
+    }
+
+    /// Save config to active path if present, otherwise default path.
+    pub fn save(&self) -> std::io::Result<PathBuf> {
+        let path = Self::active_path().unwrap_or_else(Self::default_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(std::io::Error::other)?;
+        std::fs::write(&path, json)?;
+        Ok(path)
     }
 }
 
@@ -137,7 +156,11 @@ mod tests {
             "no_color": true,
             "sniff": true,
             "record_path": "/tmp/calls",
-            "max_history": 500
+            "max_history": 500,
+            "speed_dials": {
+                "1": "sip:alice@example.com",
+                "2": "sip:bob@example.com"
+            }
         }"#;
         let cfg: SiprConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.user, Some("bob".into()));
@@ -147,6 +170,13 @@ mod tests {
         assert_eq!(cfg.no_color, Some(true));
         assert_eq!(cfg.sniff, Some(true));
         assert_eq!(cfg.max_history, Some(500));
+        assert_eq!(
+            cfg.speed_dials
+                .as_ref()
+                .and_then(|m| m.get("1"))
+                .map(|s| s.as_str()),
+            Some("sip:alice@example.com")
+        );
     }
 
     #[test]
@@ -161,6 +191,7 @@ mod tests {
     fn test_template_is_valid_json() {
         let template = SiprConfig::template();
         let _: SiprConfig = serde_json::from_str(&template).unwrap();
+        assert!(template.contains("\"speed_dials\""));
     }
 
     #[test]

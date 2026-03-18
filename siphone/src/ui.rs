@@ -486,6 +486,7 @@ pub fn print_help() {
     println!("  {c}hold{r}               {g}Put call on hold{r}");
     println!("  {c}resume{r}             {g}Resume held call{r}");
     println!("  {c}transfer{r} {y}<uri>{r}     {g}Blind transfer (REFER){r}");
+    println!("  {c}speed{r} {y}<0-9>{r}         {g}Transfer using configured speed dial slot{r}");
     println!("  {c}hangup{r}             {g}End the call{r}");
     println!();
     println!("{b}{c}  DTMF{r}");
@@ -507,6 +508,7 @@ pub fn print_help() {
     println!("  {c}sniff verbose{r}      {g}Trace with full headers{r}");
     println!("  {c}sniff stop{r}         {g}Stop SIP tracing{r}");
     println!("  {c}flows{r}              {g}Show call flow diagram{r}");
+    println!("  {c}Ctrl+0..9{r}          {g}Shortcut for 'speed <slot>'{r}");
     println!();
 }
 

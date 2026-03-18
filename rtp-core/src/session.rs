@@ -256,7 +256,6 @@ impl RtpSession {
         let socket = self.socket.clone();
         let codec_type = self.config.codec;
         let jitter_size = self.config.jitter_buffer_size;
-        let expected_source = self.config.remote_addr;
 
         tokio::spawn(async move {
             let mut codec = CodecPipeline::new(codec_type);
@@ -267,13 +266,22 @@ impl RtpSession {
                 tokio::select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((len, source)) => {
-                                // Filter packets from unexpected sources
-                                if source.ip() != expected_source.ip() {
-                                    continue;
-                                }
+                            Ok((len, _source)) => {
                                 match RtpPacket::parse(&buf[..len]) {
                                     Ok(packet) => {
+                                        // RFC 5761: payload types 64-95 are reserved for RTCP
+                                        // when multiplexed on the RTP port.  Silently discard
+                                        // them so RTCP SR/RR/SDES/BYE packets (PT 200-204,
+                                        // which land here as 72-76) are never decoded as audio.
+                                        if packet.payload_type >= 64 && packet.payload_type <= 95 {
+                                            continue;
+                                        }
+                                        // Also skip any payload type that is not the negotiated
+                                        // codec — catches any other stray control traffic.
+                                        if packet.payload_type != codec_type.payload_type() {
+                                            continue;
+                                        }
+
                                         jitter.insert(packet);
 
                                         // Pop one packet per received packet (don't drain greedily
@@ -333,7 +341,6 @@ impl RtpSession {
         let socket = self.socket.clone();
         let codec_type = self.config.codec;
         let jitter_size = self.config.jitter_buffer_size;
-        let expected_source = self.config.remote_addr;
 
         tokio::spawn(async move {
             let mut codec = CodecPipeline::new(codec_type);
@@ -344,13 +351,14 @@ impl RtpSession {
                 tokio::select! {
                     result = socket.recv_from(&mut buf) => {
                         match result {
-                            Ok((len, source)) => {
-                                // Filter packets from unexpected sources
-                                if source.ip() != expected_source.ip() {
-                                    continue;
-                                }
+                            Ok((len, _source)) => {
                                 match RtpPacket::parse(&buf[..len]) {
                                     Ok(packet) => {
+                                        // RFC 5761: discard RTCP-range payload types (64-95)
+                                        if packet.payload_type >= 64 && packet.payload_type <= 95 {
+                                            continue;
+                                        }
+
                                         if let Some(pt) = dtmf_payload_type {
                                             if packet.payload_type == pt {
                                                 if let Some(dtmf) = parse_rfc2833_event(&packet) {

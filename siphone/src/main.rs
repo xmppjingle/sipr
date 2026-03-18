@@ -4,10 +4,12 @@ mod sip_debug;
 pub(crate) mod ui;
 
 use clap::{Parser, Subcommand};
+use crossterm::terminal::disable_raw_mode;
 use phone::SoftPhone;
 use rtp_core::audio_device::{AudioConfig, DeviceSelector};
 #[cfg(feature = "audio-device")]
 use rtp_core::audio_device::TestToneGenerator;
+use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(
@@ -57,15 +59,19 @@ enum Commands {
     },
 
     /// Make an outbound SIP call
-    #[command(long_about = "Initiate an outbound SIP call to the specified URI.\n\
+    #[command(
+        visible_alias = "dial",
+        long_about = "Initiate an outbound SIP call to the specified URI.\n\
                             The call will use RTP for audio transport with G.711 codec.\n\
                             Press Ctrl+C to hang up during an active call.\n\n\
                             Examples:\n  \
+                              siphone dial 1\n  \
                               siphone call sip:2234@135.125.159.46 --user 2234\n  \
                               siphone call sip:bob@example.com\n  \
                               siphone call sip:bob@example.com --server sip.example.com --user alice\n  \
                               siphone call sip:bob@192.168.1.100 --user alice --record call.wav\n  \
-                              siphone call sip:bob@example.com --user alice --codec pcma")]
+                              siphone call sip:bob@example.com --user alice --codec pcma"
+    )]
     Call {
         /// SIP URI to call (e.g., sip:bob@example.com)
         uri: String,
@@ -226,6 +232,40 @@ enum Commands {
         #[arg(long)]
         show: bool,
     },
+    /// Manage speed-dial SIP URI slots (0-9)
+    #[command(long_about = "Store SIP URIs in speed-dial slots and call by slot.\n\n\
+                            Examples:\n  \
+                              siphone speed-dial set 1 sip:bob@example.com\n  \
+                              siphone speed-dial list\n  \
+                              siphone call 1")]
+    SpeedDial {
+        #[command(subcommand)]
+        action: SpeedDialAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpeedDialAction {
+    /// Set slot to SIP URI
+    #[command(visible_alias = "update")]
+    Set {
+        /// Speed-dial slot (0-9)
+        slot: u8,
+        /// SIP URI (e.g., sip:bob@example.com)
+        uri: String,
+    },
+    /// Remove slot mapping
+    Remove {
+        /// Speed-dial slot (0-9)
+        slot: u8,
+    },
+    /// List all slots
+    List,
+    /// Show one slot
+    Show {
+        /// Speed-dial slot (0-9)
+        slot: u8,
+    },
 }
 
 fn parse_codec(s: &str) -> Result<rtp_core::CodecType, String> {
@@ -239,10 +279,11 @@ fn parse_codec(s: &str) -> Result<rtp_core::CodecType, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    recover_terminal_state();
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
-    let cfg = config::SiprConfig::load();
+    let mut cfg = config::SiprConfig::load();
 
     // Apply color settings
     if cli.no_color || cfg.no_color.unwrap_or(false) {
@@ -289,6 +330,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             record,
             sniff,
         } => {
+            let call_uri = resolve_call_target(&cfg, &uri)?;
             // Merge: CLI > config > defaults
             let server = server.or(cfg.server.clone());
             let user = user.or(cfg.user.clone());
@@ -318,14 +360,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
             phone
                 .call(
-                    &uri,
+                    &call_uri,
                     server.as_deref(),
                     user.as_deref(),
                     password.as_deref(),
                     codec,
                 )
                 .await?;
-            ui::event(&format!("Calling {}...", uri));
+            ui::event(&format!("Calling {}...", call_uri));
 
             let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
             tokio::select! {
@@ -488,9 +530,144 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::SpeedDial { action } => {
+            match action {
+                SpeedDialAction::Set { slot, uri } => {
+                    validate_speed_slot(slot)?;
+                    if !uri.starts_with("sip:") {
+                        return Err("speed-dial URI must start with sip:".into());
+                    }
+                    let map = cfg.speed_dials.get_or_insert_with(Default::default);
+                    map.insert(slot.to_string(), uri.clone());
+                    let path = cfg.save()?;
+                    ui::success(&format!("Set speed dial {} -> {}", slot, uri));
+                    ui::info(&format!("Saved: {}", path.display()));
+                }
+                SpeedDialAction::Remove { slot } => {
+                    validate_speed_slot(slot)?;
+                    if let Some(map) = cfg.speed_dials.as_mut() {
+                        if map.remove(&slot.to_string()).is_some() {
+                            let path = cfg.save()?;
+                            ui::success(&format!("Removed speed dial {}", slot));
+                            ui::info(&format!("Saved: {}", path.display()));
+                        } else {
+                            ui::warning(&format!("Speed dial {} not set.", slot));
+                        }
+                    } else {
+                        ui::warning("No speed dials configured.");
+                    }
+                }
+                SpeedDialAction::List => {
+                    let map = cfg.speed_dials.as_ref();
+                    if map.map(|m| m.is_empty()).unwrap_or(true) {
+                        ui::info("No speed dials configured.");
+                    } else if let Some(map) = map {
+                        println!("Speed dials:");
+                        for slot in 0..=9u8 {
+                            if let Some(uri) = map.get(&slot.to_string()) {
+                                println!("  {} -> {}", slot, uri);
+                            }
+                        }
+                    }
+                }
+                SpeedDialAction::Show { slot } => {
+                    validate_speed_slot(slot)?;
+                    if let Some(uri) = cfg
+                        .speed_dials
+                        .as_ref()
+                        .and_then(|m| m.get(&slot.to_string()))
+                    {
+                        ui::info(&format!("{} -> {}", slot, uri));
+                    } else {
+                        ui::warning(&format!("Speed dial {} not set.", slot));
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn recover_terminal_state() {
+    // Best-effort terminal recovery in case a previous interactive session
+    // exited before restoring cooked mode/newline behavior.
+    let _ = disable_raw_mode();
+
+    #[cfg(unix)]
+    {
+        if std::io::stdin().is_terminal() {
+            let _ = std::process::Command::new("stty")
+                .arg("sane")
+                .status();
+        }
+    }
+}
+
+fn validate_speed_slot(slot: u8) -> Result<(), Box<dyn std::error::Error>> {
+    if slot <= 9 {
+        Ok(())
+    } else {
+        Err("speed-dial slot must be 0-9".into())
+    }
+}
+
+fn resolve_call_target(cfg: &config::SiprConfig, uri_or_slot: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if uri_or_slot.len() == 1 && uri_or_slot.chars().all(|c| c.is_ascii_digit()) {
+        if let Some(target) = cfg
+            .speed_dials
+            .as_ref()
+            .and_then(|m| m.get(uri_or_slot))
+        {
+            return Ok(target.clone());
+        }
+        return Err(format!(
+            "Speed dial {} is not set. Use: siphone speed-dial set {} sip:user@host",
+            uri_or_slot, uri_or_slot
+        )
+        .into());
+    }
+    Ok(uri_or_slot.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn test_validate_speed_slot_bounds() {
+        assert!(validate_speed_slot(0).is_ok());
+        assert!(validate_speed_slot(9).is_ok());
+        assert!(validate_speed_slot(10).is_err());
+    }
+
+    #[test]
+    fn test_resolve_call_target_with_direct_uri() {
+        let cfg = config::SiprConfig::default();
+        let target = resolve_call_target(&cfg, "sip:bob@example.com").unwrap();
+        assert_eq!(target, "sip:bob@example.com");
+    }
+
+    #[test]
+    fn test_resolve_call_target_with_speed_dial_slot() {
+        let mut dials = BTreeMap::new();
+        dials.insert("1".to_string(), "sip:alice@example.com".to_string());
+        let cfg = config::SiprConfig {
+            speed_dials: Some(dials),
+            ..Default::default()
+        };
+
+        let target = resolve_call_target(&cfg, "1").unwrap();
+        assert_eq!(target, "sip:alice@example.com");
+    }
+
+    #[test]
+    fn test_resolve_call_target_with_unset_slot_returns_error() {
+        let cfg = config::SiprConfig::default();
+        let err = resolve_call_target(&cfg, "2").unwrap_err().to_string();
+        assert!(err.contains("Speed dial 2 is not set"));
+    }
 }
 
 fn cmd_devices() {

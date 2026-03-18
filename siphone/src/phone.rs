@@ -271,8 +271,20 @@ impl SoftPhone {
         let rtp_session = RtpSession::new(rtp_config).await?;
         let rtp_port = rtp_session.local_addr().port();
 
+        // Detect the real outbound IP by connecting a probe socket to the server.
+        // When bound to 0.0.0.0 the OS picks the interface; local_addr() then
+        // returns the actual source IP the kernel would use for this destination.
+        let sdp_local_ip = {
+            let probe = std::net::UdpSocket::bind("0.0.0.0:0")
+                .ok()
+                .and_then(|s| { let _ = s.connect(rtp_remote); s.local_addr().ok() })
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| self.local_ip.clone());
+            if probe == "0.0.0.0" { self.local_ip.clone() } else { probe }
+        };
+
         // Build SDP offer
-        let mut sdp = SdpSession::new(&self.local_ip);
+        let mut sdp = SdpSession::new(&sdp_local_ip);
         sdp.add_audio_media(rtp_port);
         self.local_dtmf_payload_type = sdp.get_audio_dtmf_payload_type().unwrap_or(101);
         self.remote_dtmf_payload_type = None;
@@ -875,6 +887,35 @@ impl SoftPhone {
                                         match self.transfer(parts[1]).await {
                                             Ok(_) => crate::ui::status(&format!("REFER sent to transfer call to {}", parts[1])),
                                             Err(e) => crate::ui::error(&format!("Transfer failed: {}", e)),
+                                        }
+                                    }
+                                }
+                                "speed" | "sd" => {
+                                    if parts.len() < 2 {
+                                        crate::ui::warning("Usage: speed <slot 0-9>");
+                                    } else {
+                                        let slot = parts[1];
+                                        if slot.len() == 1 && slot.chars().all(|c| c.is_ascii_digit()) {
+                                            if let Some(target) = speed_dial_target(slot) {
+                                                crate::ui::info(&format!("Speed dial {} -> {}", slot, target));
+                                                match self.transfer(&target).await {
+                                                    Ok(_) => crate::ui::status(&format!(
+                                                        "REFER sent to speed dial {}",
+                                                        slot
+                                                    )),
+                                                    Err(e) => crate::ui::error(&format!(
+                                                        "Speed dial transfer failed: {}",
+                                                        e
+                                                    )),
+                                                }
+                                            } else {
+                                                crate::ui::warning(&format!(
+                                                    "Speed dial {} not configured.",
+                                                    slot
+                                                ));
+                                            }
+                                        } else {
+                                            crate::ui::warning("Speed slot must be 0-9.");
                                         }
                                     }
                                 }
@@ -1641,6 +1682,11 @@ fn is_ctrl_char(key: &KeyEvent, ch: char, ctrl_code: char) -> bool {
         || matches!(key.code, KeyCode::Char(c) if c == ctrl_code)
 }
 
+fn speed_dial_target(slot: &str) -> Option<String> {
+    let cfg = crate::config::SiprConfig::load();
+    cfg.speed_dials.and_then(|m| m.get(slot).cloned())
+}
+
 fn find_reverse_history_match(
     history: &[String],
     query: &str,
@@ -1751,6 +1797,12 @@ fn start_interactive_command_reader(max_history: usize) -> (tokio::sync::mpsc::R
                     _ if is_ctrl_char(&key, 'c', '\u{3}') => {
                         let _ = tx.blocking_send("hangup".to_string());
                         break;
+                    }
+                    KeyCode::Char(d)
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && d.is_ascii_digit() =>
+                    {
+                        let _ = tx.blocking_send(format!("speed {}", d));
                     }
                     _ if is_ctrl_char(&key, 'r', '\u{12}') => {
                         search_mode = true;

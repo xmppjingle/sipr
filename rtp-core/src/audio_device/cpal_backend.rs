@@ -280,11 +280,37 @@ impl AudioPlayback {
         let dst_rate = device_rate as f64;
         let out_channels = device_channels;
 
+        // Playout buffer thresholds (all in output samples).
+        //
+        // The sender's RTP clock and the hardware audio clock are independent oscillators
+        // that drift apart over time.  Without RTCP Sender Reports there is no external
+        // reference to correct them, so we do adaptive clock recovery entirely from buffer
+        // level:
+        //
+        //  • high-water (3 frames / 60 ms): buffer is growing → sender faster than hardware.
+        //    Drop 1 sample per frame by blending adjacent samples (linear interpolation).
+        //    Effect: ~0.6 % speed-up, nearly inaudible.
+        //
+        //  • low-water  (1 frame / 20 ms): buffer is shrinking → sender slower than hardware.
+        //    Duplicate 1 sample per frame.
+        //    Effect: ~0.6 % slow-down, nearly inaudible.
+        //
+        //  • hard cap   (4 frames / 80 ms): safety net for burst arrivals.
+        //    When exceeded, trim to the midpoint (2 frames / 40 ms) to create headroom before
+        //    the next potential overflow.  This is a last-resort discontinuity; in steady state
+        //    the adaptive logic above should keep the buffer between low- and high-water.
+        let samples_per_frame_out = (dst_rate / 50.0 * out_channels as f64) as usize;
+        let low_water  = samples_per_frame_out;           // 1 frame  (~20 ms)
+        let high_water = samples_per_frame_out * 3;       // 3 frames (~60 ms)
+        let max_buf_samples = samples_per_frame_out * 4;  // 4 frames (~80 ms) hard cap
+
         let (tx, mut rx) = mpsc::channel::<Vec<i16>>(32);
         let buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let buffer_clone = buffer.clone();
 
-        // Spawn a task to receive i16 frames, resample/channel-convert, and buffer as f32
+        // Spawn a task to receive i16 frames, resample/channel-convert, and buffer as f32.
+        // Adaptive clock correction is applied here so the real-time audio callback never
+        // needs to do anything but drain the local buffer.
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 let resampled = if need_resample {
@@ -297,31 +323,66 @@ impl AudioPlayback {
                 } else {
                     resampled
                 };
-                // Convert i16 to f32 [-1.0, 1.0] with clamping
-                let float_samples: Vec<f32> = converted
+                // Convert i16 → f32 [-1.0, 1.0]
+                let mut float_samples: Vec<f32> = converted
                     .iter()
                     .map(|&s| (s as f32 / 32768.0).clamp(-1.0, 1.0))
                     .collect();
+
                 if let Ok(mut buf) = buffer_clone.lock() {
+                    // Adaptive rate correction based on current buffer occupancy.
+                    if buf.len() > high_water && float_samples.len() > 2 {
+                        // Buffer growing: drop 1 sample near the middle via linear blend.
+                        // Choosing the midpoint minimises audible discontinuity compared
+                        // with dropping at the edges.
+                        let mid = float_samples.len() / 2;
+                        let blended = (float_samples[mid] + float_samples[mid + 1]) / 2.0;
+                        float_samples[mid] = blended;
+                        float_samples.remove(mid + 1);
+                    } else if buf.len() < low_water && !float_samples.is_empty() {
+                        // Buffer shrinking: duplicate 1 sample near the middle.
+                        let mid = float_samples.len() / 2;
+                        let dup = float_samples[mid];
+                        float_samples.insert(mid + 1, dup);
+                    }
+
                     buf.extend(float_samples.iter());
+
+                    // Hard cap: burst protection.  Trim to midpoint to leave headroom.
+                    if buf.len() > max_buf_samples {
+                        let target = max_buf_samples / 2;
+                        let excess = buf.len().saturating_sub(target);
+                        buf.drain(..excess);
+                    }
                 }
             }
         });
 
         let buffer_for_stream = buffer.clone();
 
+        // Local buffer owned exclusively by the audio callback (no lock needed to read it).
+        // On each invocation we try to drain the shared Mutex buffer into this local one in a
+        // single short critical section, then serve output from the local copy.  This means the
+        // real-time audio thread never blocks waiting for the tokio producer.
+        //
+        // VecDeque is used so that pop_front() and draining from the front are O(1).
+        // Vec::drain(..n) from the front shifts all remaining elements, which is O(n) and
+        // creates non-deterministic callback timing → occasional underruns → clicks.
+        let mut local_buf: VecDeque<f32> = VecDeque::with_capacity(max_buf_samples);
+
         let stream = device
             .build_output_stream(
                 &stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if let Ok(mut buf) = buffer_for_stream.lock() {
-                        for sample in data.iter_mut() {
-                            *sample = buf.pop_front().unwrap_or(0.0);
-                        }
-                    } else {
-                        for sample in data.iter_mut() {
-                            *sample = 0.0;
-                        }
+                    // Try to grab all pending samples from the shared buffer in one shot.
+                    // try_lock() never blocks: if the producer holds the lock we simply
+                    // serve from whatever is already in local_buf.
+                    if let Ok(mut shared) = buffer_for_stream.try_lock() {
+                        local_buf.extend(shared.drain(..));
+                    }
+
+                    for sample in data.iter_mut() {
+                        *sample = local_buf.pop_front().unwrap_or(0.0);
                     }
                 },
                 |err| {

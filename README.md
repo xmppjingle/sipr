@@ -36,6 +36,7 @@
 - **Call recording** — save incoming audio to WAV with `--record`
 - **Interactive command history** — Up/Down navigation with persistent history in `~/.sipr.history`
 - **Reverse history search** — `Ctrl+R` incremental search inside in-call CLI
+- **Speed dial slots** — store SIP URIs in config (`0-9`) and dial quickly with `siphone call <slot>`
 - **SIP + RTP flow tracing** — `sniff`/`flows` now shows early media and connected RTP flow events
 - **Cross-platform audio** — CoreAudio (macOS), ALSA (Linux), WASAPI (Windows) via [cpal](https://github.com/RustAudioGroup/cpal)
 - **Jitter buffer** — handles out-of-order and delayed packets gracefully
@@ -56,11 +57,28 @@ Press **`Ctrl+C`** to hang up.
 
 ## Changelog (short)
 
-### Unreleased
+### v0.3.0
 
+- **Fixed audio degradation over call time** — replaced hard buffer trim with adaptive clock
+  recovery. When the sender RTP clock drifts faster than the audio hardware clock, 1 sample per
+  frame is gently dropped (linear blend, ~0.6% rate adjust) instead of a hard discontinuous trim
+  that repeated every few seconds. Symmetric low-water duplicate keeps latency bounded in both
+  directions. A hard cap (80 ms) still acts as a burst safety net but trims to the 40 ms midpoint
+  to leave headroom.
+- **Fixed metallic artifacts from RTCP packets decoded as audio** — RTCP packets (PT 200–204) were
+  parsed as RTP with payload type 72–76 and fed to the G.711 decoder, producing brief metallic
+  noise. Added RFC 5761 payload type filter (PT 64–95) to discard them before decoding.
+- **Fixed unbounded playback latency** — added a 4-frame (80 ms) cap to the output buffer to
+  prevent the mpsc channel from filling, which previously caused silent-frame drops heard as clicks.
+- **Fixed real-time audio callback blocking** — changed `Mutex::lock` (potentially blocking) to
+  `try_lock` in the cpal output callback, with a local `VecDeque` that drains in one short critical
+  section. Eliminated O(n) `Vec::drain` front-drain artefacts by using `VecDeque::pop_front`.
 - Added persistent in-call history (`~/.sipr.history`) with Up/Down navigation.
 - Added `Ctrl+R` reverse search for in-call command history.
 - Added `max_history` config option (default `1000`) to cap stored history entries.
+- Added speed dial slots in config (`speed_dials`) with CLI management commands.
+- Added `siphone call <slot>` support to dial speed-dial entries directly.
+- Added in-call shortcut `Ctrl+0..9` for quick speed-dial transfer (`speed <slot>`).
 - Added RTP flow visibility in `flows`, including:
   - early media RTP announced on `183`
   - connected RTP announced on `200 OK`
@@ -134,6 +152,14 @@ Or route through a specific SIP proxy:
 siphone call sip:bob@example.com --server sip.proxy.com --user alice
 ```
 
+Call a configured speed-dial slot:
+
+```sh
+siphone call 1
+# or:
+siphone dial 1
+```
+
 ### Accept Incoming Calls
 
 Listen for inbound INVITEs on a specific port:
@@ -158,11 +184,13 @@ dtmf-queue     # show queued DTMF count
 sniff          # start SIP tracing
 sniff verbose  # SIP tracing with full message details
 flows          # show SIP ladder + RTP flow events (EARLY/CONNECTED/RX/TX)
+speed 1        # transfer call to speed-dial slot 1 (REFER)
 hangup         # send BYE and wait for 200 OK (up to 3 seconds)
 ```
 
 Incoming DTMF is announced in the CLI for both RTP RFC2833 and SIP INFO.
 Use **Up/Down** for history and **Ctrl+R** to search history.
+Use **Ctrl+0..9** as a shortcut for `speed <slot>`.
 
 ### Config File
 
@@ -177,6 +205,36 @@ Example history limit:
 ```json
 {
   "max_history": 1000
+}
+```
+
+Configure speed dials from CLI:
+
+```sh
+# Set slot 1
+siphone speed-dial set 1 sip:bob@example.com
+
+# Update slot 1 (alias of set)
+siphone speed-dial update 1 sip:bob@new.example.com
+
+# Show one slot
+siphone speed-dial show 1
+
+# List all configured slots
+siphone speed-dial list
+
+# Remove slot
+siphone speed-dial remove 1
+```
+
+Or define directly in config JSON:
+
+```json
+{
+  "speed_dials": {
+    "1": "sip:alice@example.com",
+    "2": "sip:bob@example.com"
+  }
 }
 ```
 

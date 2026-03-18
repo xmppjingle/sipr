@@ -1,0 +1,42 @@
+name: Publish Homebrew Formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
+      tap_repo:
+        description: "Homebrew tap repo (owner/homebrew-sipr)"
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sipr repo
+        uses: actions/checkout@v4
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.tap_repo }}
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Update Formula/siphone.rb
+        run: |
+          ./scripts/update-homebrew-formula.sh "${{ inputs.tag }}" "tap/Formula/siphone.rb"
+
+      - name: Commit and push formula update
+        run: |
+          cd tap
+          if git diff --quiet -- Formula/siphone.rb; then
+            echo "No formula changes detected."
+            exit 0
+          fi
+          git add Formula/siphone.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "siphone ${{ inputs.tag }}"
+          git push
