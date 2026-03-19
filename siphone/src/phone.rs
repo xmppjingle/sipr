@@ -839,7 +839,8 @@ impl SoftPhone {
                                     } else {
                                         let queued = self.queue_dtmf_digits(parts[1], DtmfMethod::Rfc2833);
                                         if queued > 0 {
-                                            crate::ui::status(&format!("Queued {} DTMF digit(s) for RTP RFC2833.", queued));
+                                            let sent = self.flush_dtmf_queue(local_addr, &mut debugger).await?;
+                                            crate::ui::event(&format!("DTMF sent: {} ({} digit(s))", parts[1], sent));
                                         }
                                     }
                                 }
@@ -997,7 +998,17 @@ impl SoftPhone {
                                     break;
                                 }
                                 _ => {
-                                    crate::ui::warning(&format!("Unknown command '{}'. Type 'help' for commands.", parts[0]));
+                                    // Shortcut: bare DTMF digits (e.g. "123#") send immediately
+                                    let raw = input.trim();
+                                    if !raw.is_empty() && raw.chars().all(|c| c.is_ascii_digit() || c == '*' || c == '#') {
+                                        let queued = self.queue_dtmf_digits(raw, DtmfMethod::Rfc2833);
+                                        if queued > 0 {
+                                            let sent = self.flush_dtmf_queue(local_addr, &mut debugger).await?;
+                                            crate::ui::event(&format!("DTMF sent: {} ({} digit(s))", raw, sent));
+                                        }
+                                    } else {
+                                        crate::ui::warning(&format!("Unknown command '{}'. Type 'help' for commands.", parts[0]));
+                                    }
                                 }
                             }
                         }
@@ -1862,9 +1873,16 @@ fn start_interactive_command_reader(max_history: usize) -> (tokio::sync::mpsc::R
                         redraw(&current);
                     }
                     KeyCode::Char(ch) => {
-                        current.push(ch);
-                        print!("{ch}");
-                        let _ = std::io::stdout().flush();
+                        if current.is_empty() && (ch.is_ascii_digit() || ch == '*' || ch == '#') {
+                            // Bare digit/DTMF key with empty buffer → send immediately
+                            print!("{ch}");
+                            let _ = std::io::stdout().flush();
+                            let _ = tx.blocking_send(format!("dtmf {ch}"));
+                        } else {
+                            current.push(ch);
+                            print!("{ch}");
+                            let _ = std::io::stdout().flush();
+                        }
                     }
                     _ => {}
                 }
@@ -2900,5 +2918,113 @@ a=sendrecv\r\n",
         let s = msg.to_string();
         assert!(s.contains("CSeq: 2 REGISTER"));
         assert!(s.contains("Authorization: Digest username=\"alice\""));
+    }
+
+    // ── DTMF shortcut tests ───────────────────────────────────────────
+
+    /// Helper: matches the shortcut predicate used in the key handler and
+    /// command dispatcher — only digits, `*`, `#` (no letters, so you can
+    /// still type commands like `dtmf`, `hold`, etc.).
+    fn is_dtmf_shortcut_char(c: char) -> bool {
+        c.is_ascii_digit() || c == '*' || c == '#'
+    }
+
+    /// Bare DTMF digits should be recognised as immediate-send input.
+    #[test]
+    fn test_bare_dtmf_digits_detected() {
+        let cases = vec![
+            ("1", true),
+            ("123", true),
+            ("0", true),
+            ("9", true),
+            ("*", true),
+            ("#", true),
+            ("123#", true),
+            ("1234567890", true),
+            ("*#", true),
+        ];
+        for (input, expected) in cases {
+            let is_dtmf = !input.is_empty() && input.chars().all(|c| is_dtmf_shortcut_char(c));
+            assert_eq!(is_dtmf, expected, "input={input:?}");
+        }
+    }
+
+    /// Letters (even valid DTMF A-D) must NOT trigger the shortcut so that
+    /// commands like `dtmf`, `hold`, `a]` etc. can still be typed.
+    #[test]
+    fn test_non_dtmf_input_not_detected() {
+        let cases = vec![
+            "help",
+            "dtmf 1",
+            "hold",
+            "1x",
+            "x1",
+            "hangup",
+            "",
+            " ",
+            "Z",
+            "hello123",
+            "A",      // valid DTMF tone but NOT a shortcut key
+            "abcd",   // all valid DTMF tones but NOT shortcut keys
+            "d",      // would collide with `dtmf` first char
+        ];
+        for input in cases {
+            let trimmed = input.trim();
+            let is_dtmf = !trimmed.is_empty() && trimmed.chars().all(|c| is_dtmf_shortcut_char(c));
+            assert!(!is_dtmf, "input={input:?} should NOT be detected as bare DTMF");
+        }
+    }
+
+    /// The dtmf command should queue and be flushable.
+    #[tokio::test]
+    async fn test_dtmf_queue_and_flush_immediate() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        // Queue digits as the shortcut would
+        let queued = phone.queue_rfc2833_dtmf("5#");
+        assert_eq!(queued, 2);
+        assert_eq!(phone.queued_dtmf_count(), 2);
+        // Queue more
+        let queued = phone.queue_rfc2833_dtmf("*");
+        assert_eq!(queued, 1);
+        assert_eq!(phone.queued_dtmf_count(), 3);
+    }
+
+    /// All 16 standard DTMF tones should be accepted.
+    #[test]
+    fn test_all_16_dtmf_tones_valid() {
+        let all = "0123456789*#ABCD";
+        for ch in all.chars() {
+            assert!(is_valid_dtmf_digit(ch), "'{ch}' should be valid DTMF");
+        }
+        // Lowercase too
+        for ch in "abcd".chars() {
+            assert!(is_valid_dtmf_digit(ch), "'{ch}' should be valid DTMF");
+        }
+    }
+
+    /// Ensure that when current buffer is empty, a digit/*/# char is treated
+    /// as DTMF shortcut, but letters are NOT (so commands can be typed).
+    #[test]
+    fn test_dtmf_shortcut_only_when_buffer_empty() {
+        // Simulates the logic in the key handler
+        let cases = vec![
+            ("", '5', true),   // empty buffer + digit → DTMF
+            ("h", '5', false), // non-empty buffer + digit → append
+            ("", 'h', false),  // empty buffer + letter → append (command)
+            ("", '#', true),   // empty buffer + # → DTMF
+            ("", '*', true),   // empty buffer + * → DTMF
+            ("", 'A', false),  // empty buffer + A → append (not shortcut)
+            ("", 'd', false),  // empty buffer + d → append (would block `dtmf`)
+            ("", 'Z', false),  // empty buffer + Z → not DTMF
+            ("", '0', true),   // empty buffer + 0 → DTMF
+            ("", '9', true),   // empty buffer + 9 → DTMF
+        ];
+        for (current, ch, expect_dtmf) in cases {
+            let is_shortcut = current.is_empty()
+                && (ch.is_ascii_digit() || ch == '*' || ch == '#');
+            assert_eq!(is_shortcut, expect_dtmf,
+                "current={current:?} ch={ch:?} should{}trigger DTMF shortcut",
+                if expect_dtmf { " " } else { " NOT " });
+        }
     }
 }

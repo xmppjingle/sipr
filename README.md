@@ -73,6 +73,9 @@ Press **`Ctrl+C`** to hang up.
 - **Fixed real-time audio callback blocking** — changed `Mutex::lock` (potentially blocking) to
   `try_lock` in the cpal output callback, with a local `VecDeque` that drains in one short critical
   section. Eliminated O(n) `Vec::drain` front-drain artefacts by using `VecDeque::pop_front`.
+- **Instant DTMF keypress** — pressing `0-9`, `*`, or `#` during a call sends the DTMF tone
+  immediately via RTP RFC2833, no Enter required. Letters are not intercepted so commands like
+  `dtmf`, `hold`, etc. can still be typed normally. Use `dtmf A` for tones A-D.
 - Added persistent in-call history (`~/.sipr.history`) with Up/Down navigation.
 - Added `Ctrl+R` reverse search for in-call command history.
 - Added `max_history` config option (default `1000`) to cap stored history entries.
