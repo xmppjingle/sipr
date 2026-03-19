@@ -3,7 +3,11 @@ name = "sip-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "SIP protocol library for parsing, serialization, and dialog management"
+keywords = ["sip", "voip", "protocol", "rfc3261", "telephony"]
+categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
 tokio = { workspace = true }

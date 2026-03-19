@@ -6,6 +6,8 @@ resolver = "2"
 version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/xmppjingle/sipr"
+homepage = "https://github.com/xmppjingle/sipr"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

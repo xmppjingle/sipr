@@ -3,7 +3,11 @@ name = "siphone"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI SIP softphone application"
+repository.workspace = true
+homepage.workspace = true
+description = "A SIP softphone that lives in your terminal — make calls, send DTMF, and record audio from the CLI"
+keywords = ["sip", "softphone", "voip", "cli", "telephone"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [[bin]]
 name = "siphone"
@@ -14,8 +18,8 @@ default = ["audio-device"]
 audio-device = ["rtp-core/audio-device"]
 
 [dependencies]
-sip-core = { path = "../sip-core" }
-rtp-core = { path = "../rtp-core" }
+sip-core = { path = "../sip-core", version = "0.3.0" }
+rtp-core = { path = "../rtp-core", version = "0.3.0" }
 tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }

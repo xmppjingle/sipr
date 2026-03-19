@@ -3,7 +3,11 @@ name = "rtp-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "RTP media transport with jitter buffer and codec support"
+keywords = ["rtp", "audio", "voip", "jitter-buffer", "g711"]
+categories = ["multimedia::audio", "network-programming"]
 
 [features]
 default = ["audio-device", "opus"]
