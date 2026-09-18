@@ -14,12 +14,13 @@ name = "siphone"
 path = "src/main.rs"
 
 [features]
-default = ["audio-device"]
+default = ["audio-device", "opus"]
 audio-device = ["rtp-core/audio-device"]
+opus = ["rtp-core/opus"]
 
 [dependencies]
 sip-core = { path = "../sip-core", version = "0.3.0" }
-rtp-core = { path = "../rtp-core", version = "0.3.0" }
+rtp-core = { path = "../rtp-core", version = "0.3.0", default-features = false }
 tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }

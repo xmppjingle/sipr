@@ -1763,6 +1763,7 @@ fn e2e_codec_type_display() {
     assert_eq!(format!("{}", CodecType::Pcmu), "PCMU (G.711 mu-law)");
     assert_eq!(format!("{}", CodecType::Pcma), "PCMA (G.711 A-law)");
     assert_eq!(format!("{}", CodecType::Opus), "Opus");
+    assert_eq!(format!("{}", CodecType::AmrWb), "AMR-WB (G.722.2)");
 }
 
 // =============================================================================

@@ -52,6 +52,7 @@ pub struct SessionConfig {
     pub codec: CodecType,
     pub ssrc: u32,
     pub jitter_buffer_size: usize,
+    pub octet_align: crate::amrwb::OctetAlign,
 }
 
 impl SessionConfig {
@@ -62,7 +63,13 @@ impl SessionConfig {
             codec,
             ssrc: rand::random(),
             jitter_buffer_size: 10,
+            octet_align: crate::amrwb::OctetAlign::One,
         }
+    }
+
+    pub fn with_octet_align(mut self, octet_align: crate::amrwb::OctetAlign) -> Self {
+        self.octet_align = octet_align;
+        self
     }
 }
 
@@ -82,7 +89,7 @@ impl RtpSession {
     pub async fn new(config: SessionConfig) -> Result<Self, SessionError> {
         let socket = UdpSocket::bind(&config.local_addr).await?;
         let local_addr = socket.local_addr()?;
-        let codec = CodecPipeline::new(config.codec);
+        let codec = CodecPipeline::with_octet_align(config.codec, config.octet_align);
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -103,6 +110,15 @@ impl RtpSession {
     /// Update the remote address (e.g. after receiving SDP answer)
     pub fn set_remote_addr(&mut self, addr: SocketAddr) {
         self.config.remote_addr = addr;
+    }
+
+    /// Switch the send codec (e.g. 183 PCMU early media, then 200 AMR-WB).
+    pub fn set_codec(&mut self, codec: CodecType) {
+        if self.config.codec == codec {
+            return;
+        }
+        self.config.codec = codec;
+        self.codec = CodecPipeline::with_octet_align(codec, self.config.octet_align);
     }
 
     /// Send PCM audio samples as an RTP packet
@@ -239,7 +255,7 @@ impl RtpSession {
     }
 
     /// Get a silence frame for this session's codec
-    pub fn silence_frame(&self) -> Vec<u8> {
+    pub fn silence_frame(&mut self) -> Vec<u8> {
         self.codec.silence_frame()
     }
 
@@ -255,10 +271,11 @@ impl RtpSession {
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let socket = self.socket.clone();
         let codec_type = self.config.codec;
+        let octet_align = self.config.octet_align;
         let jitter_size = self.config.jitter_buffer_size;
 
         tokio::spawn(async move {
-            let mut codec = CodecPipeline::new(codec_type);
+            let mut codec = CodecPipeline::with_octet_align(codec_type, octet_align);
             let mut jitter = JitterBuffer::new(jitter_size);
             let mut buf = vec![0u8; 65535];
 
@@ -276,10 +293,18 @@ impl RtpSession {
                                         if packet.payload_type >= 64 && packet.payload_type <= 95 {
                                             continue;
                                         }
-                                        // Also skip any payload type that is not the negotiated
-                                        // codec — catches any other stray control traffic.
-                                        if packet.payload_type != codec_type.payload_type() {
+                                        let Some(pt_codec) =
+                                            crate::codec::CodecType::from_payload_type(
+                                                packet.payload_type,
+                                            )
+                                        else {
                                             continue;
+                                        };
+                                        if codec.codec_type() != pt_codec {
+                                            codec = CodecPipeline::with_octet_align(
+                                                pt_codec,
+                                                octet_align,
+                                            );
                                         }
 
                                         jitter.insert(packet);
@@ -340,10 +365,11 @@ impl RtpSession {
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let socket = self.socket.clone();
         let codec_type = self.config.codec;
+        let octet_align = self.config.octet_align;
         let jitter_size = self.config.jitter_buffer_size;
 
         tokio::spawn(async move {
-            let mut codec = CodecPipeline::new(codec_type);
+            let mut codec = CodecPipeline::with_octet_align(codec_type, octet_align);
             let mut jitter = JitterBuffer::new(jitter_size);
             let mut buf = vec![0u8; 65535];
 
@@ -370,6 +396,18 @@ impl RtpSession {
                                                 }
                                                 continue;
                                             }
+                                        }
+
+                                        let Some(pt_codec) =
+                                            CodecType::from_payload_type(packet.payload_type)
+                                        else {
+                                            continue;
+                                        };
+                                        if codec.codec_type() != pt_codec {
+                                            codec = CodecPipeline::with_octet_align(
+                                                pt_codec,
+                                                octet_align,
+                                            );
                                         }
 
                                         jitter.insert(packet);
@@ -578,7 +616,7 @@ mod tests {
     async fn test_silence_frame() {
         let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
         let config = SessionConfig::new("127.0.0.1:0", remote_addr, CodecType::Pcmu);
-        let session = RtpSession::new(config).await.unwrap();
+        let mut session = RtpSession::new(config).await.unwrap();
 
         let silence = session.silence_frame();
         assert_eq!(silence.len(), 160);

@@ -8,7 +8,7 @@ pub mod auth;
 
 pub use message::{SipMessage, SipMethod, SipRequest, SipResponse, StatusCode};
 pub use header::{Header, HeaderName, HeaderValue, Headers};
-pub use sdp::SdpSession;
+pub use sdp::{AudioOffer, OctetAlign, OfferedCodec, SdpSession};
 pub use dialog::{SipDialog, DialogState};
 pub use transaction::{SipTransaction, TransactionState, TransactionKind};
 pub use transport::SipTransport;

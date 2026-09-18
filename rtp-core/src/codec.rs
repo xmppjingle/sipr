@@ -10,6 +10,8 @@ pub enum CodecType {
     Pcma,
     /// Opus codec, payload type 111 (dynamic)
     Opus,
+    /// AMR-WB (G.722.2), payload type 102 (dynamic), 16 kHz
+    AmrWb,
 }
 
 impl fmt::Display for CodecType {
@@ -18,6 +20,7 @@ impl fmt::Display for CodecType {
             CodecType::Pcmu => write!(f, "PCMU (G.711 mu-law)"),
             CodecType::Pcma => write!(f, "PCMA (G.711 A-law)"),
             CodecType::Opus => write!(f, "Opus"),
+            CodecType::AmrWb => write!(f, "AMR-WB (G.722.2)"),
         }
     }
 }
@@ -28,6 +31,7 @@ impl CodecType {
             CodecType::Pcmu => 0,
             CodecType::Pcma => 8,
             CodecType::Opus => 111,
+            CodecType::AmrWb => crate::amrwb::PAYLOAD_TYPE,
         }
     }
 
@@ -36,6 +40,7 @@ impl CodecType {
             CodecType::Pcmu => 8000,
             CodecType::Pcma => 8000,
             CodecType::Opus => 48000,
+            CodecType::AmrWb => 16000,
         }
     }
 
@@ -44,6 +49,17 @@ impl CodecType {
             CodecType::Pcmu => "PCMU",
             CodecType::Pcma => "PCMA",
             CodecType::Opus => "opus",
+            CodecType::AmrWb => "AMR-WB",
+        }
+    }
+
+    pub fn from_sdp_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "pcmu" | "ulaw" | "g711u" | "g711" => Some(CodecType::Pcmu),
+            "pcma" | "alaw" | "g711a" => Some(CodecType::Pcma),
+            "opus" => Some(CodecType::Opus),
+            "amrwb" | "amr-wb" | "amr_wb" => Some(CodecType::AmrWb),
+            _ => None,
         }
     }
 
@@ -52,6 +68,7 @@ impl CodecType {
             0 => Some(CodecType::Pcmu),
             8 => Some(CodecType::Pcma),
             111 => Some(CodecType::Opus),
+            102 => Some(CodecType::AmrWb),
             _ => None,
         }
     }
@@ -62,6 +79,7 @@ impl CodecType {
             CodecType::Pcmu => 160,  // 8000 * 0.020
             CodecType::Pcma => 160,
             CodecType::Opus => 960,  // 48000 * 0.020
+            CodecType::AmrWb => crate::amrwb::SAMPLES_PER_FRAME,
         }
     }
 }
@@ -81,8 +99,11 @@ pub enum CodecError {
 /// For PCMU/PCMA, we implement the G.711 codec directly.
 /// For Opus, uses the audiopus crate when the "opus" feature is enabled,
 /// otherwise falls back to a raw-bytes stub.
+/// For AMR-WB, uses a real G.722.2 encoder/decoder with RFC 4867 packing.
 pub struct CodecPipeline {
     codec: CodecType,
+    octet_align: crate::amrwb::OctetAlign,
+    amr: Option<crate::amrwb::AmrWbRtp>,
     #[cfg(feature = "opus")]
     opus_encoder: Option<audiopus::coder::Encoder>,
     #[cfg(feature = "opus")]
@@ -91,6 +112,10 @@ pub struct CodecPipeline {
 
 impl CodecPipeline {
     pub fn new(codec: CodecType) -> Self {
+        Self::with_octet_align(codec, crate::amrwb::OctetAlign::One)
+    }
+
+    pub fn with_octet_align(codec: CodecType, octet_align: crate::amrwb::OctetAlign) -> Self {
         #[cfg(feature = "opus")]
         let (opus_encoder, opus_decoder) = if codec == CodecType::Opus {
             let enc = audiopus::coder::Encoder::new(
@@ -107,13 +132,31 @@ impl CodecPipeline {
             (None, None)
         };
 
+        let amr = if codec == CodecType::AmrWb {
+            match crate::amrwb::AmrWbRtp::new(octet_align) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!("AMR-WB codec init failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             codec,
+            octet_align,
+            amr,
             #[cfg(feature = "opus")]
             opus_encoder,
             #[cfg(feature = "opus")]
             opus_decoder,
         }
+    }
+
+    pub fn octet_align(&self) -> crate::amrwb::OctetAlign {
+        self.octet_align
     }
 
     pub fn codec_type(&self) -> CodecType {
@@ -142,6 +185,13 @@ impl CodecPipeline {
                     bytes.extend_from_slice(&sample.to_le_bytes());
                 }
                 Ok(bytes)
+            }
+            CodecType::AmrWb => {
+                let amr = self.amr.as_mut().ok_or_else(|| {
+                    CodecError::EncodingError("AMR-WB encoder not initialized".into())
+                })?;
+                amr.encode_rtp(pcm_samples)
+                    .map_err(CodecError::EncodingError)
             }
         }
     }
@@ -178,15 +228,25 @@ impl CodecPipeline {
                     .collect();
                 Ok(samples)
             }
+            CodecType::AmrWb => {
+                let amr = self.amr.as_mut().ok_or_else(|| {
+                    CodecError::DecodingError("AMR-WB decoder not initialized".into())
+                })?;
+                amr.decode_rtp(data).map_err(CodecError::DecodingError)
+            }
         }
     }
 
     /// Generate silence for one frame
-    pub fn silence_frame(&self) -> Vec<u8> {
+    pub fn silence_frame(&mut self) -> Vec<u8> {
         match self.codec {
             CodecType::Pcmu => vec![0xFF; self.codec.samples_per_frame()], // mu-law silence
             CodecType::Pcma => vec![0xD5; self.codec.samples_per_frame()], // A-law silence
             CodecType::Opus => vec![0; self.codec.samples_per_frame() * 2], // stub silence
+            CodecType::AmrWb => match self.amr.as_mut() {
+                Some(amr) => amr.silence_rtp(),
+                None => vec![0u8; 2],
+            },
         }
     }
 }
@@ -303,13 +363,16 @@ mod tests {
         assert_eq!(CodecType::Pcmu.payload_type(), 0);
         assert_eq!(CodecType::Pcma.payload_type(), 8);
         assert_eq!(CodecType::Opus.payload_type(), 111);
+        assert_eq!(CodecType::AmrWb.payload_type(), 102);
 
         assert_eq!(CodecType::Pcmu.clock_rate(), 8000);
         assert_eq!(CodecType::Opus.clock_rate(), 48000);
+        assert_eq!(CodecType::AmrWb.clock_rate(), 16000);
 
         assert_eq!(CodecType::Pcmu.name(), "PCMU");
         assert_eq!(CodecType::Pcma.name(), "PCMA");
         assert_eq!(CodecType::Opus.name(), "opus");
+        assert_eq!(CodecType::AmrWb.name(), "AMR-WB");
     }
 
     #[test]
@@ -317,6 +380,7 @@ mod tests {
         assert_eq!(CodecType::from_payload_type(0), Some(CodecType::Pcmu));
         assert_eq!(CodecType::from_payload_type(8), Some(CodecType::Pcma));
         assert_eq!(CodecType::from_payload_type(111), Some(CodecType::Opus));
+        assert_eq!(CodecType::from_payload_type(102), Some(CodecType::AmrWb));
         assert_eq!(CodecType::from_payload_type(99), None);
     }
 
@@ -325,6 +389,40 @@ mod tests {
         assert_eq!(CodecType::Pcmu.samples_per_frame(), 160);
         assert_eq!(CodecType::Pcma.samples_per_frame(), 160);
         assert_eq!(CodecType::Opus.samples_per_frame(), 960);
+        assert_eq!(CodecType::AmrWb.samples_per_frame(), 320);
+    }
+
+    #[test]
+    fn test_amrwb_encode_decode_roundtrip() {
+        let mut codec = CodecPipeline::with_octet_align(
+            CodecType::AmrWb,
+            crate::amrwb::OctetAlign::One,
+        );
+        let mut original = Vec::new();
+        let mut decoded = Vec::new();
+        for _ in 0..40 {
+            let samples = crate::wav::generate_sine_tone(700.0, 16000, 20, 14000);
+            original.extend_from_slice(&samples);
+            let encoded = codec.encode(&samples).unwrap();
+            let out = codec.decode(&encoded).unwrap();
+            assert_eq!(out.len(), 320);
+            decoded.extend_from_slice(&out);
+        }
+        let mut best_corr = f64::NEG_INFINITY;
+        let mut best_snr = 0.0;
+        for lag in 0..=640 {
+            if decoded.len() <= lag + 1600 {
+                continue;
+            }
+            let n = original.len().min(decoded.len() - lag);
+            let corr = crate::wav::cross_correlation(&original[..n], &decoded[lag..lag + n]);
+            if corr > best_corr {
+                best_corr = corr;
+                best_snr = crate::wav::compute_snr(&original[..n], &decoded[lag..lag + n]);
+            }
+        }
+        assert!(best_snr > 20.0, "AMR-WB pipeline SNR {best_snr:.1} dB");
+        assert!(best_corr > 0.95, "AMR-WB pipeline corr {best_corr:.4}");
     }
 
     #[test]
@@ -398,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_pcmu_silence() {
-        let codec = CodecPipeline::new(CodecType::Pcmu);
+        let mut codec = CodecPipeline::new(CodecType::Pcmu);
         let silence = codec.silence_frame();
         assert_eq!(silence.len(), 160);
         assert!(silence.iter().all(|&b| b == 0xFF));
@@ -406,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_pcma_silence() {
-        let codec = CodecPipeline::new(CodecType::Pcma);
+        let mut codec = CodecPipeline::new(CodecType::Pcma);
         let silence = codec.silence_frame();
         assert_eq!(silence.len(), 160);
         assert!(silence.iter().all(|&b| b == 0xD5));

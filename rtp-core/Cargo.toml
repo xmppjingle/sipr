@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 cpal = { version = "0.15", optional = true }
 audiopus = { version = "0.3.0-rc.0", optional = true }
+rvoip-codec-core = { version = "0.3.10", features = ["amr-wb"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

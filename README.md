@@ -28,7 +28,7 @@
 - **Zero-config calls** — dial a SIP URI directly, no registration needed
 - **Digest authentication** — RFC 2617 MD5 challenge-response for 401/407, works with Ooma, Asterisk, FreeSWITCH, etc.
 - **Incoming call support** — accept inbound INVITEs with the `listen` command
-- **Real-time audio** — G.711 mu-law & A-law codecs at 8 kHz, plus real Opus codec at 48 kHz
+- **Real-time audio** — G.711 mu-law & A-law at 8 kHz, Opus at 48 kHz, and **AMR-WB (G.722.2)** at 16 kHz with selectable RFC 4867 `octet-align` (`1`, `0`, or omitted)
 - **Call hold/resume** — re-INVITE with `a=sendonly` / `a=sendrecv` SDP direction
 - **Call transfer (REFER)** — blind transfers with Refer-To and NOTIFY status updates
 - **PRACK** — reliable provisional responses (100rel / RFC 3262)
@@ -161,6 +161,35 @@ Call a configured speed-dial slot:
 siphone call 1
 # or:
 siphone dial 1
+```
+
+AMR-WB with selectable RFC 4867 octet-align (needed for executor e2e / Fusion):
+
+```sh
+# octet-aligned (fmtp octet-align=1) — typical Fusion / OA=1 path
+siphone call sip:15550200@127.0.0.1:5080 --codec amrwb --octet-align 1
+
+# bandwidth-efficient (fmtp octet-align=0)
+siphone call sip:15550200@127.0.0.1:5080 --codec amrwb --octet-align 0
+
+# omit the token (RFC default = bandwidth-efficient)
+siphone call sip:15550200@127.0.0.1:5080 --codec amrwb --octet-align omit
+
+# ordered offer (AMR-WB first, G.711 fallback)
+siphone call sip:15550200@127.0.0.1:5080 --codecs amrwb,pcmu --octet-align 1
+
+# headless e2e (no TTY): tone TX, auto hang-up, SIPp-shaped SIP dump, WAV RX
+siphone call sip:+15550200@127.0.0.1:5080 --bind 127.0.0.1:5060 \
+  --codec amrwb --octet-align 1 --duration 6 --tone 700 \
+  --record /tmp/a.wav --sip-log /tmp/a.log --headless --no-color
+```
+
+UAS for the same rig (`183` with SDP, then `200`):
+
+```sh
+siphone listen --bind 127.0.0.1:5072 --codec amrwb --octet-align 1 \
+  --early-media --duration 20 --tone 1400 \
+  --record /tmp/b.wav --sip-log /tmp/b.log --headless --no-color
 ```
 
 ### Accept Incoming Calls

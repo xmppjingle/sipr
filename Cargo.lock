@@ -1288,6 +1288,7 @@ dependencies = [
  "bytes",
  "cpal",
  "rand",
+ "rvoip-codec-core",
  "serde",
  "thiserror",
  "tokio",
@@ -1318,6 +1319,17 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "rvoip-codec-core"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94ea2e5a92544caa8b849abe853a5f0ea903628259ad47f53e6181c9dc8c334f"
+dependencies = [
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "same-file"
@@ -1435,6 +1447,7 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "rand",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",

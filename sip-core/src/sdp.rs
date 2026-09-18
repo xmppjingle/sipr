@@ -88,6 +88,285 @@ impl MediaDescription {
     pub fn add_attribute(&mut self, name: &str, value: Option<&str>) {
         self.attributes.push((name.to_string(), value.map(|s| s.to_string())));
     }
+
+    /// `a=fmtp:<pt> ...` value for this payload type, if present.
+    pub fn fmtp_for(&self, payload_type: u8) -> Option<&str> {
+        let prefix = format!("{} ", payload_type);
+        for (name, value) in &self.attributes {
+            if name != "fmtp" {
+                continue;
+            }
+            if let Some(val) = value {
+                if val.starts_with(&prefix) {
+                    return Some(val[prefix.len()..].trim());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// AMR-WB `octet-align` in `a=fmtp` (RFC 4867). Omitted means bandwidth-efficient (0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OctetAlign {
+    /// `octet-align=1` (octet-aligned)
+    #[default]
+    One,
+    /// `octet-align=0` (bandwidth-efficient)
+    Zero,
+    /// No `octet-align` token (RFC 4867 default = 0)
+    Omitted,
+}
+
+impl OctetAlign {
+    pub fn parse_token(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "one" | "oa1" | "octet" | "octet-aligned" => Ok(OctetAlign::One),
+            "0" | "zero" | "oa0" | "be" | "bandwidth-efficient" => Ok(OctetAlign::Zero),
+            "omit" | "omitted" | "none" | "rfc" => Ok(OctetAlign::Omitted),
+            other => Err(format!(
+                "Unknown octet-align '{}'. Use 1, 0, or omit",
+                other
+            )),
+        }
+    }
+
+    /// Parse from an AMR/AMR-WB fmtp body (`octet-align=1; mode-set=8`).
+    pub fn from_fmtp(fmtp: &str) -> Self {
+        for part in fmtp.split(';') {
+            let part = part.trim();
+            if let Some(val) = part
+                .strip_prefix("octet-align=")
+                .or_else(|| part.strip_prefix("octet-align ="))
+            {
+                return match val.trim() {
+                    "1" => OctetAlign::One,
+                    "0" => OctetAlign::Zero,
+                    _ => OctetAlign::Omitted,
+                };
+            }
+        }
+        OctetAlign::Omitted
+    }
+
+    /// Token for `a=fmtp` (`None` means omit the parameter).
+    pub fn fmtp_token(self) -> Option<&'static str> {
+        match self {
+            OctetAlign::One => Some("octet-align=1"),
+            OctetAlign::Zero => Some("octet-align=0"),
+            OctetAlign::Omitted => None,
+        }
+    }
+}
+
+impl fmt::Display for OctetAlign {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OctetAlign::One => write!(f, "1"),
+            OctetAlign::Zero => write!(f, "0"),
+            OctetAlign::Omitted => write!(f, "omitted"),
+        }
+    }
+}
+
+/// One codec (or DTMF) line in an SDP audio offer/answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfferedCodec {
+    Pcmu,
+    Pcma,
+    Opus { channels: u32 },
+    AmrWb {
+        payload_type: u8,
+        octet_align: OctetAlign,
+        mode_set: Option<String>,
+    },
+    TelephoneEvent { payload_type: u8, clock_rate: u32 },
+}
+
+impl OfferedCodec {
+    pub const AMR_WB_PT: u8 = 102;
+    pub const TE_WB_PT: u8 = 104;
+    pub const TE_NB_PT: u8 = 101;
+
+    pub fn payload_type(&self) -> u8 {
+        match self {
+            OfferedCodec::Pcmu => 0,
+            OfferedCodec::Pcma => 8,
+            OfferedCodec::Opus { .. } => 111,
+            OfferedCodec::AmrWb { payload_type, .. } => *payload_type,
+            OfferedCodec::TelephoneEvent { payload_type, .. } => *payload_type,
+        }
+    }
+
+    pub fn encoding_name(&self) -> &'static str {
+        match self {
+            OfferedCodec::Pcmu => "PCMU",
+            OfferedCodec::Pcma => "PCMA",
+            OfferedCodec::Opus { .. } => "opus",
+            OfferedCodec::AmrWb { .. } => "AMR-WB",
+            OfferedCodec::TelephoneEvent { .. } => "telephone-event",
+        }
+    }
+}
+
+/// Ordered SDP audio payload list. Default matches historic sipr offers (G.711 + opus).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioOffer {
+    pub codecs: Vec<OfferedCodec>,
+    pub direction: String,
+}
+
+impl Default for AudioOffer {
+    fn default() -> Self {
+        Self::g711_opus()
+    }
+}
+
+impl AudioOffer {
+    /// Historic sipr offer: PCMU, PCMA, telephone-event/8000, opus.
+    pub fn g711_opus() -> Self {
+        Self {
+            codecs: vec![
+                OfferedCodec::Pcmu,
+                OfferedCodec::Pcma,
+                OfferedCodec::TelephoneEvent {
+                    payload_type: OfferedCodec::TE_NB_PT,
+                    clock_rate: 8000,
+                },
+                OfferedCodec::Opus { channels: 2 },
+            ],
+            direction: "sendrecv".to_string(),
+        }
+    }
+
+    pub fn pcmu_only() -> Self {
+        Self {
+            codecs: vec![
+                OfferedCodec::Pcmu,
+                OfferedCodec::TelephoneEvent {
+                    payload_type: OfferedCodec::TE_NB_PT,
+                    clock_rate: 8000,
+                },
+            ],
+            direction: "sendrecv".to_string(),
+        }
+    }
+
+    /// AMR-WB preferred, then G.711. OA is applied to the AMR-WB fmtp.
+    pub fn amrwb_then_g711(octet_align: OctetAlign) -> Self {
+        Self::from_names(&["amrwb", "pcmu", "pcma"], octet_align)
+    }
+
+    /// G.711 preferred, AMR-WB second (Patrick IN2 / OUT2).
+    pub fn g711_then_amrwb(octet_align: OctetAlign) -> Self {
+        Self::from_names(&["pcmu", "amrwb"], octet_align)
+    }
+
+    /// Build from CLI names: `amrwb`, `pcmu`, `pcma`, `opus`.
+    pub fn from_names(names: &[&str], octet_align: OctetAlign) -> Self {
+        let mut codecs = Vec::new();
+        let mut saw_amrwb = false;
+        let mut saw_te8 = false;
+        for raw in names {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "amrwb" | "amr-wb" | "amr_wb" => {
+                    saw_amrwb = true;
+                    codecs.push(OfferedCodec::AmrWb {
+                        payload_type: OfferedCodec::AMR_WB_PT,
+                        octet_align,
+                        mode_set: Some("8".to_string()),
+                    });
+                    codecs.push(OfferedCodec::TelephoneEvent {
+                        payload_type: OfferedCodec::TE_WB_PT,
+                        clock_rate: 16000,
+                    });
+                }
+                "pcmu" | "ulaw" | "g711u" | "g711" => codecs.push(OfferedCodec::Pcmu),
+                "pcma" | "alaw" | "g711a" => codecs.push(OfferedCodec::Pcma),
+                "opus" => codecs.push(OfferedCodec::Opus { channels: 2 }),
+                _ => {}
+            }
+        }
+        if codecs
+            .iter()
+            .any(|c| matches!(c, OfferedCodec::TelephoneEvent { clock_rate: 8000, .. }))
+        {
+            saw_te8 = true;
+        }
+        if !saw_te8 {
+            codecs.push(OfferedCodec::TelephoneEvent {
+                payload_type: OfferedCodec::TE_NB_PT,
+                clock_rate: 8000,
+            });
+        }
+        let _ = saw_amrwb;
+        Self {
+            codecs,
+            direction: "sendrecv".to_string(),
+        }
+    }
+
+    pub fn with_direction(mut self, direction: &str) -> Self {
+        self.direction = direction.to_string();
+        self
+    }
+
+    /// AMR-WB only (plus telephone-event/16000). Used as an SDP answer.
+    pub fn amrwb_only(octet_align: OctetAlign) -> Self {
+        Self::from_names(&["amrwb"], octet_align)
+    }
+
+    /// First non-DTMF encoding name (SDP `rtpmap` name).
+    pub fn primary_name(&self) -> Option<&'static str> {
+        self.codecs.iter().find_map(|c| match c {
+            OfferedCodec::TelephoneEvent { .. } => None,
+            other => Some(other.encoding_name()),
+        })
+    }
+
+    /// Override AMR-WB `mode-set=` on every AMR-WB payload in this offer.
+    pub fn with_amrwb_mode_set(mut self, mode_set: &str) -> Self {
+        for codec in &mut self.codecs {
+            if let OfferedCodec::AmrWb { mode_set: ms, .. } = codec {
+                *ms = Some(mode_set.to_string());
+            }
+        }
+        self
+    }
+
+    /// Octet-align of the AMR-WB payload, or `Omitted` if none is offered.
+    pub fn octet_align(&self) -> OctetAlign {
+        self.codecs
+            .iter()
+            .find_map(|c| match c {
+                OfferedCodec::AmrWb { octet_align, .. } => Some(*octet_align),
+                _ => None,
+            })
+            .unwrap_or(OctetAlign::Omitted)
+    }
+
+    /// Answer with the first codec we support from a remote offer.
+    pub fn answer_from_remote(sdp: &SdpSession) -> Self {
+        let names = sdp.audio_codec_names();
+        let oa = sdp.amr_wb_octet_align().unwrap_or(OctetAlign::Omitted);
+        let has = |want: &str| {
+            names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(want))
+        };
+        if has("AMR-WB") {
+            Self::amrwb_only(oa)
+        } else if has("PCMU") {
+            Self::pcmu_only()
+        } else if has("PCMA") {
+            Self::from_names(&["pcma"], oa)
+        } else if has("opus") {
+            Self::from_names(&["opus"], oa)
+        } else {
+            Self::g711_opus()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,14 +409,13 @@ impl SdpSession {
     }
 
     pub fn add_audio_media(&mut self, port: u16) -> &mut MediaDescription {
+        self.add_audio_media_offer(port, &AudioOffer::g711_opus())
+    }
+
+    /// Offer/answer with an explicit codec list (AMR-WB + octet-align, G.711-only, …).
+    pub fn add_audio_media_offer(&mut self, port: u16, offer: &AudioOffer) -> &mut MediaDescription {
         let mut media = MediaDescription::new_audio(port);
-        // Add standard codecs
-        media.add_codec(0, "PCMU", 8000, None);
-        media.add_codec(8, "PCMA", 8000, None);
-        media.add_codec(101, "telephone-event", 8000, None);
-        media.add_attribute("fmtp", Some("101 0-15"));
-        media.add_codec(111, "opus", 48000, Some(2));
-        media.add_attribute("sendrecv", None);
+        apply_offer_to_media(&mut media, offer);
         self.media_descriptions.push(media);
         self.media_descriptions.last_mut().unwrap()
     }
@@ -289,15 +567,7 @@ impl SdpSession {
 
     /// Create an audio media section with a specific direction attribute (for hold/resume).
     pub fn add_audio_media_directed(&mut self, port: u16, direction: &str) -> &mut MediaDescription {
-        let mut media = MediaDescription::new_audio(port);
-        media.add_codec(0, "PCMU", 8000, None);
-        media.add_codec(8, "PCMA", 8000, None);
-        media.add_codec(101, "telephone-event", 8000, None);
-        media.add_attribute("fmtp", Some("101 0-15"));
-        media.add_codec(111, "opus", 48000, Some(2));
-        media.add_attribute(direction, None);
-        self.media_descriptions.push(media);
-        self.media_descriptions.last_mut().unwrap()
+        self.add_audio_media_offer(port, &AudioOffer::g711_opus().with_direction(direction))
     }
 
     /// Get the media direction attribute (sendrecv, sendonly, recvonly, inactive).
@@ -322,6 +592,96 @@ impl SdpSession {
             .iter()
             .find(|rtpmap| rtpmap.encoding_name.eq_ignore_ascii_case("telephone-event"))
             .map(|rtpmap| rtpmap.payload_type)
+    }
+
+    /// Ordered audio encoding names from `m=` / rtpmap, telephone-event omitted.
+    pub fn audio_codec_names(&self) -> Vec<String> {
+        let Some(audio) = self
+            .media_descriptions
+            .iter()
+            .find(|m| m.media_type == MediaType::Audio)
+        else {
+            return Vec::new();
+        };
+        audio
+            .formats
+            .iter()
+            .filter_map(|pt| {
+                let name = audio
+                    .rtpmaps
+                    .iter()
+                    .find(|r| r.payload_type == *pt)
+                    .map(|r| r.encoding_name.as_str())
+                    .or_else(|| match pt {
+                        0 => Some("PCMU"),
+                        8 => Some("PCMA"),
+                        _ => None,
+                    })?;
+                if name.eq_ignore_ascii_case("telephone-event") {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// Octet-align on the first AMR-WB payload. `None` if AMR-WB is not offered.
+    pub fn amr_wb_octet_align(&self) -> Option<OctetAlign> {
+        let audio = self
+            .media_descriptions
+            .iter()
+            .find(|m| m.media_type == MediaType::Audio)?;
+        let rtpmap = audio
+            .rtpmaps
+            .iter()
+            .find(|r| r.encoding_name.eq_ignore_ascii_case("AMR-WB"))?;
+        match audio.fmtp_for(rtpmap.payload_type) {
+            Some(fmtp) => Some(OctetAlign::from_fmtp(fmtp)),
+            None => Some(OctetAlign::Omitted),
+        }
+    }
+}
+
+fn apply_offer_to_media(media: &mut MediaDescription, offer: &AudioOffer) {
+    for codec in &offer.codecs {
+        match codec {
+            OfferedCodec::Pcmu => media.add_codec(0, "PCMU", 8000, None),
+            OfferedCodec::Pcma => media.add_codec(8, "PCMA", 8000, None),
+            OfferedCodec::Opus { channels } => {
+                media.add_codec(111, "opus", 48000, Some(*channels));
+            }
+            OfferedCodec::AmrWb {
+                payload_type,
+                octet_align,
+                mode_set,
+            } => {
+                media.add_codec(*payload_type, "AMR-WB", 16000, None);
+                let mut parts = Vec::new();
+                if let Some(tok) = octet_align.fmtp_token() {
+                    parts.push(tok.to_string());
+                }
+                if let Some(ms) = mode_set {
+                    parts.push(format!("mode-set={}", ms));
+                }
+                if !parts.is_empty() {
+                    media.add_attribute(
+                        "fmtp",
+                        Some(&format!("{} {}", payload_type, parts.join("; "))),
+                    );
+                }
+            }
+            OfferedCodec::TelephoneEvent {
+                payload_type,
+                clock_rate,
+            } => {
+                media.add_codec(*payload_type, "telephone-event", *clock_rate, None);
+                media.add_attribute("fmtp", Some(&format!("{} 0-15", payload_type)));
+            }
+        }
+    }
+    if !offer.direction.is_empty() {
+        media.add_attribute(&offer.direction, None);
     }
 }
 
@@ -419,6 +779,17 @@ mod tests {
         a=fmtp:101 0-15\r\n\
         a=rtpmap:111 opus/48000/2\r\n\
         a=sendrecv\r\n";
+
+    #[test]
+    fn test_amrwb_mode_set_override() {
+        let offer = AudioOffer::amrwb_then_g711(OctetAlign::One).with_amrwb_mode_set("0,1,2");
+        let mut sdp = SdpSession::new("127.0.0.1");
+        sdp.add_audio_media_offer(4000, &offer);
+        let wire = sdp.to_string();
+        assert!(wire.contains("mode-set=0,1,2"), "{wire}");
+        assert!(!wire.contains("mode-set=8"), "{wire}");
+        assert!(wire.contains("octet-align=1"), "{wire}");
+    }
 
     #[test]
     fn test_parse_sdp() {
@@ -594,5 +965,82 @@ a=sendonly\r\n";
         let sdp = SdpSession::parse(sdp_text).unwrap();
         assert_eq!(sdp.get_audio_direction(), Some("sendonly"));
         assert_eq!(sdp.get_audio_port(), Some(4000));
+    }
+
+    #[test]
+    fn test_amrwb_offer_oa1() {
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media_offer(5072, &AudioOffer::amrwb_then_g711(OctetAlign::One));
+        let wire = sdp.to_string();
+        assert!(wire.contains("m=audio 5072 RTP/AVP 102 104 0 8 101"));
+        assert!(wire.contains("a=rtpmap:102 AMR-WB/16000"));
+        assert!(wire.contains("a=fmtp:102 octet-align=1; mode-set=8"));
+        assert!(wire.contains("a=rtpmap:104 telephone-event/16000"));
+        assert_eq!(sdp.amr_wb_octet_align(), Some(OctetAlign::One));
+        assert_eq!(sdp.audio_codec_names()[0], "AMR-WB");
+    }
+
+    #[test]
+    fn test_amrwb_offer_oa0_and_omitted() {
+        let mut sdp0 = SdpSession::new("10.0.0.1");
+        sdp0.add_audio_media_offer(5004, &AudioOffer::amrwb_then_g711(OctetAlign::Zero));
+        let w0 = sdp0.to_string();
+        assert!(w0.contains("octet-align=0"));
+        assert!(!w0.contains("octet-align=1"));
+        assert_eq!(sdp0.amr_wb_octet_align(), Some(OctetAlign::Zero));
+
+        let mut sdp_omit = SdpSession::new("10.0.0.1");
+        sdp_omit.add_audio_media_offer(5004, &AudioOffer::amrwb_then_g711(OctetAlign::Omitted));
+        let wo = sdp_omit.to_string();
+        assert!(!wo.contains("octet-align="));
+        assert!(wo.contains("a=fmtp:102 mode-set=8"));
+        assert_eq!(sdp_omit.amr_wb_octet_align(), Some(OctetAlign::Omitted));
+    }
+
+    #[test]
+    fn test_parse_amrwb_oa_from_wire() {
+        let sdp = SdpSession::parse(
+            "v=0\r\n\
+o=- 1 1 IN IP4 10.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 10.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 4000 RTP/AVP 102 0\r\n\
+a=rtpmap:102 AMR-WB/16000\r\n\
+a=fmtp:102 octet-align=1; mode-set=8\r\n\
+a=rtpmap:0 PCMU/8000\r\n",
+        )
+        .unwrap();
+        assert_eq!(sdp.amr_wb_octet_align(), Some(OctetAlign::One));
+        assert_eq!(sdp.audio_codec_names(), vec!["AMR-WB", "PCMU"]);
+    }
+
+    #[test]
+    fn test_g711_then_amrwb_first_codec() {
+        let mut sdp = SdpSession::new("10.0.0.1");
+        sdp.add_audio_media_offer(5004, &AudioOffer::g711_then_amrwb(OctetAlign::One));
+        assert_eq!(sdp.audio_codec_names()[0], "PCMU");
+        assert!(sdp.audio_codec_names().iter().any(|n| n == "AMR-WB"));
+    }
+
+    #[test]
+    fn test_octet_align_parse_token() {
+        assert_eq!(OctetAlign::parse_token("1").unwrap(), OctetAlign::One);
+        assert_eq!(OctetAlign::parse_token("0").unwrap(), OctetAlign::Zero);
+        assert_eq!(OctetAlign::parse_token("omit").unwrap(), OctetAlign::Omitted);
+        assert!(OctetAlign::parse_token("xyz").is_err());
+    }
+
+    #[test]
+    fn test_answer_from_remote_honors_amrwb_oa() {
+        let mut offer = SdpSession::new("10.0.0.1");
+        offer.add_audio_media_offer(5072, &AudioOffer::amrwb_then_g711(OctetAlign::Zero));
+        let answer = AudioOffer::answer_from_remote(&offer);
+        assert_eq!(answer.primary_name(), Some("AMR-WB"));
+        assert_eq!(answer.octet_align(), OctetAlign::Zero);
+        assert!(!answer
+            .codecs
+            .iter()
+            .any(|c| matches!(c, OfferedCodec::Pcmu)));
     }
 }
