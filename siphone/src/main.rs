@@ -152,6 +152,9 @@ enum Commands {
         /// Preferred answer codec when the offer allows it: pcmu, pcma, opus, or amrwb
         #[arg(long, value_parser = parse_codec)]
         codec: Option<rtp_core::CodecType>,
+        /// Comma-separated answer codecs (overrides --codec). Example: amrwb
+        #[arg(long)]
+        codecs: Option<String>,
         /// AMR-WB octet-align when answering: 1, 0, or omit
         #[arg(long, value_parser = parse_octet_align)]
         octet_align: Option<sip_core::OctetAlign>,
@@ -182,6 +185,45 @@ enum Commands {
         /// AMR-WB SDP mode-set when answering
         #[arg(long)]
         mode_set: Option<String>,
+    },
+
+    /// Act as a SIPREC recorder (RFC 7866 SRS)
+    #[command(long_about = "Behave as an RFC 7866 SIPREC recording server (SRS).\n\
+                            Sends an offerless INVITE with 'Require: siprec', receives the\n\
+                            SDP offer in the 200 OK, ACKs with an SDP answer (recvonly), then\n\
+                            records the forked RTP to a WAV file. Pure headless flow.\n\n\
+                            Examples:\n  \
+                              siphone siprec sip:<uuid>@127.0.0.1:5080 --record out.wav --duration 10\n  \
+                              siphone siprec sip:<uuid>@127.0.0.1:5080 --record out.wav --wait-bye \\\n    \
+                                --sip-log srs.log --bind 127.0.0.1:6080")]
+    Siprec {
+        /// SIP URI to record (e.g., sip:<channel-uuid>@<fs-ip>:5080)
+        uri: String,
+        /// Bind SIP to host:port (defaults to 0.0.0.0:0)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Seconds to record before sending BYE (ignored with --wait-bye)
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Wait for FreeSWITCH to send BYE instead of sending one after --duration
+        #[arg(long)]
+        wait_bye: bool,
+        /// Record received RTP to a WAV file
+        #[arg(long)]
+        record: Option<String>,
+        /// Write SIPp-style SIP message dump to this path
+        #[arg(long)]
+        sip_log: Option<String>,
+        /// Max seconds to wait for the 200 OK (default 10)
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+        /// Error-path probe: receive the 200 OK but deliberately withhold the
+        /// ACK (no SDP answer, no RTP), then observe FS's missing-ACK teardown
+        #[arg(long)]
+        no_ack: bool,
+        /// Pure headless flow (no TTY / interactive loop)
+        #[arg(long)]
+        headless: bool,
     },
 
     /// List available audio devices
@@ -567,6 +609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_device,
             record,
             codec,
+            codecs,
             octet_align,
             bind,
             duration,
@@ -590,8 +633,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut phone = SoftPhone::new(&bind_addr).await?;
-            if let Some(c) = codec.or(cfg.codec) {
-                apply_media_options(&mut phone, c, octet_align.or(cfg.octet_align), None, mode_set.as_deref());
+            if codecs.is_some() || codec.or(cfg.codec).is_some() {
+                let c = codec.or(cfg.codec).unwrap_or(rtp_core::CodecType::AmrWb);
+                apply_media_options(&mut phone, c, octet_align.or(cfg.octet_align), codecs.as_deref(), mode_set.as_deref());
             }
             phone.set_headless(headless);
             phone.set_tx_tone_hz(tone);
@@ -621,6 +665,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             path, rec.duration_ms() as f64 / 1000.0, rec.frame_count())),
                         Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
                     }
+                }
+            }
+        }
+        Commands::Siprec {
+            uri,
+            bind,
+            duration,
+            wait_bye,
+            record,
+            sip_log,
+            timeout,
+            no_ack,
+            headless: _headless,
+        } => {
+            let bind_addr = sip_bind_addr(bind.as_deref(), 0);
+            ui::event(&format!("SIPREC recorder binding on {}...", bind_addr));
+            if no_ack {
+                ui::warning("no-ack mode: ACK will be withheld (FS missing-ACK teardown probe)");
+            } else if let Some(ref path) = record {
+                ui::status(&format!("Recording to: {}", path));
+            }
+
+            let mut phone = SoftPhone::new(&bind_addr).await?;
+            phone.set_headless(true);
+            phone.set_sip_log_path(sip_log.map(std::path::PathBuf::from));
+
+            // SIPREC leg records PCMU/8000; recorder matches that clock rate.
+            let mut recorder = if no_ack {
+                None
+            } else {
+                record
+                    .as_ref()
+                    .map(|_| rtp_core::AudioRecorder::new(rtp_core::CodecType::Pcmu.clock_rate()))
+            };
+
+            let result = phone
+                .siprec_record(&uri, recorder.as_mut(), duration, wait_bye, timeout, no_ack)
+                .await;
+
+            match result {
+                Ok(_) if no_ack => {
+                    // Probe succeeded as long as the 200 OK was received; the whole
+                    // point is to exercise FS's missing-ACK path, not to fail.
+                    ui::success("SIPREC no-ack probe complete (200 received, ACK withheld)");
+                }
+                Ok(packets) => {
+                    let wav_path = record.as_deref().unwrap_or("(none)");
+                    if let (Some(path), Some(ref rec)) = (&record, &recorder) {
+                        if rec.frame_count() > 0 {
+                            match rec.save_wav(path) {
+                                Ok(_) => ui::success(&format!(
+                                    "Saved recording to {} ({:.1}s, {} frames)",
+                                    path,
+                                    rec.duration_ms() as f64 / 1000.0,
+                                    rec.frame_count()
+                                )),
+                                Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
+                            }
+                        } else {
+                            ui::info("No RTP frames received, recording not saved.");
+                        }
+                    }
+                    ui::success(&format!(
+                        "SIPREC complete: {} RTP packets received, WAV: {}",
+                        packets, wav_path
+                    ));
+                    if packets == 0 {
+                        return Err("SIPREC failed: no RTP received".into());
+                    }
+                }
+                Err(e) => {
+                    ui::error(&format!("SIPREC failed: {}", e));
+                    return Err(e.into());
                 }
             }
         }

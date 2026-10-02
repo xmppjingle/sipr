@@ -424,6 +424,409 @@ impl SoftPhone {
         Ok(())
     }
 
+    /// Act as an RFC 7866 SIPREC recorder (SRS).
+    ///
+    /// Sends an *offerless* INVITE with `Require: siprec`, waits for the 200 OK
+    /// whose body carries the SDP OFFER (sendonly) from FreeSWITCH, then sends an
+    /// ACK carrying the SDP ANSWER (recvonly). The forked RTP is received and
+    /// recorded into `recorder`. Returns the number of RTP audio frames received.
+    ///
+    /// Termination: when `wait_bye` is true the recorder blocks until FreeSWITCH
+    /// sends a BYE (replying 200). Otherwise it records for `duration` seconds
+    /// (or until Ctrl+C), then sends a BYE and waits briefly for its 200.
+    ///
+    /// When `no_ack` is true this is an error-path probe: it sends the offerless
+    /// INVITE, receives the 200 OK, but deliberately withholds the ACK (no SDP
+    /// answer, no RTP). It then waits up to `timeout_secs` to observe how
+    /// FreeSWITCH tears the dialog down, reports what it saw, and returns 0.
+    ///
+    /// This path uses no audio-device/cpal types and works fully headless.
+    pub async fn siprec_record(
+        &mut self,
+        uri: &str,
+        mut recorder: Option<&mut AudioRecorder>,
+        duration: Option<u64>,
+        wait_bye: bool,
+        timeout_secs: u64,
+        no_ack: bool,
+    ) -> Result<usize, PhoneError> {
+        // SIPREC recording leg is PCMU/8000 (what FreeSWITCH offers/forks).
+        self.rtp_codec = CodecType::Pcmu;
+        self.octet_align = OctetAlign::Omitted;
+
+        let target_uri = if uri.starts_with("sip:") {
+            uri.to_string()
+        } else {
+            format!("sip:{}", uri)
+        };
+        let server_host = extract_host_from_uri(&target_uri).ok_or_else(|| {
+            PhoneError::CallFailed(
+                "Cannot extract server from URI; use sip:user@host[:port] format".into(),
+            )
+        })?;
+        let server_addr = resolve_server_addr(&server_host).await?;
+
+        let call_id = Uuid::new_v4().to_string();
+        let branch = generate_branch();
+        let local_addr = self.transport.local_addr();
+
+        // Detect the real outbound IP for the SDP answer by probing the server.
+        let sdp_local_ip = {
+            let probe = std::net::UdpSocket::bind("0.0.0.0:0")
+                .ok()
+                .and_then(|s| {
+                    let _ = s.connect(server_addr);
+                    s.local_addr().ok()
+                })
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| self.local_ip.clone());
+            if probe == "0.0.0.0" {
+                self.local_ip.clone()
+            } else {
+                probe
+            }
+        };
+
+        // Offerless INVITE: no SDP body (Content-Length: 0), Require/Supported siprec,
+        // and an SRS Contact tagged with the +sip.srs feature parameter.
+        let invite = RequestBuilder::new(SipMethod::Invite, &target_uri)
+            .header(
+                HeaderName::Via,
+                format!("SIP/2.0/UDP {};branch={};rport", local_addr, branch),
+            )
+            .header(HeaderName::MaxForwards, "70")
+            .header(
+                HeaderName::From,
+                format!("<sip:srs@{}>;tag={}", server_host, self.local_tag),
+            )
+            .header(HeaderName::To, format!("<{}>", target_uri))
+            .header(HeaderName::CallId, &call_id)
+            .header(HeaderName::CSeq, "1 INVITE")
+            .header(HeaderName::Contact, format!("<sip:srs@{}>;+sip.srs", local_addr))
+            .header(HeaderName::Require, "siprec")
+            .header(HeaderName::Supported, "siprec")
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .build();
+
+        self.log_sip(true, &invite);
+        self.transport.send_to(&invite, server_addr).await?;
+
+        let mut dialog = SipDialog::new_uac(
+            call_id.clone(),
+            self.local_tag.clone(),
+            format!("sip:srs@{}", server_host),
+            target_uri.clone(),
+        );
+
+        // Wait for the 200 OK (skipping 1xx). Its body is the SDP OFFER.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let (ok_body, ok_source) = loop {
+            let incoming = tokio::time::timeout_at(deadline, self.transport.recv())
+                .await
+                .map_err(|_| PhoneError::CallFailed("Timed out waiting for 200 OK".into()))?
+                .map_err(PhoneError::Transport)?;
+            let msg = incoming.message;
+            self.log_sip(false, &msg);
+            if !msg.is_response() {
+                continue;
+            }
+            dialog.process_response(&msg);
+            let Some(status) = msg.status() else { continue };
+            if status.is_provisional() {
+                crate::ui::info(&format!(
+                    "SIPREC progress: {} {}",
+                    status,
+                    status.reason_phrase()
+                ));
+                continue;
+            } else if status.is_success() {
+                let body = msg
+                    .body()
+                    .map(|b| b.to_string())
+                    .ok_or_else(|| PhoneError::CallFailed("200 OK had no SDP offer".into()))?;
+                break (body, incoming.source);
+            } else {
+                // Non-2xx final: ACK then fail.
+                let ack = build_ack_msg(&dialog, &local_addr);
+                self.log_sip(true, &ack);
+                let _ = self.transport.send_to(&ack, incoming.source).await;
+                return Err(PhoneError::CallFailed(format!(
+                    "SIPREC INVITE rejected: {} {}",
+                    status,
+                    status.reason_phrase()
+                )));
+            }
+        };
+
+        // Error-path probe: got the 200 OK, now deliberately withhold the ACK
+        // (no SDP answer, no RTP) and observe how FreeSWITCH tears the dialog
+        // down (it will time out waiting for the ACK and BYE / re-send the 200).
+        if no_ack {
+            crate::ui::warning("no-ack mode: received 200 OK, withholding ACK (no SDP answer, no RTP)");
+            self.dialog = Some(dialog);
+            self.remote_sip_addr = Some(ok_source);
+            self.call_id = Some(call_id);
+
+            let probe_start = tokio::time::Instant::now();
+            let probe_deadline = probe_start + std::time::Duration::from_secs(timeout_secs);
+            let mut saw_teardown = false;
+            loop {
+                let remaining = probe_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, self.transport.recv()).await {
+                    Ok(Ok(incoming)) => {
+                        let msg = incoming.message;
+                        self.log_sip(false, &msg);
+                        let elapsed = probe_start.elapsed().as_secs_f64();
+                        if let Some(method) = msg.method() {
+                            if *method == SipMethod::Bye {
+                                crate::ui::event(&format!(
+                                    "no-ack mode: FS sent BYE after {:.1}s; replying 200",
+                                    elapsed
+                                ));
+                                if let SipMessage::Request(ref req) = msg {
+                                    let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                                    self.log_sip(true, &ok);
+                                    let _ = self.transport.send_to(&ok, incoming.source).await;
+                                }
+                                if let Some(d) = self.dialog.as_mut() {
+                                    d.process_bye(&msg);
+                                }
+                                saw_teardown = true;
+                                break;
+                            } else {
+                                crate::ui::info(&format!(
+                                    "no-ack mode: received {} after {:.1}s",
+                                    method, elapsed
+                                ));
+                            }
+                        } else if let Some(status) = msg.status() {
+                            // FS retransmits the 200 OK while waiting for the ACK.
+                            crate::ui::info(&format!(
+                                "no-ack mode: received {} {} (retransmit) after {:.1}s",
+                                status,
+                                status.reason_phrase(),
+                                elapsed
+                            ));
+                        }
+                    }
+                    Ok(Err(e)) => return Err(PhoneError::Transport(e)),
+                    Err(_) => break, // timed out
+                }
+            }
+
+            let waited = probe_start.elapsed().as_secs_f64();
+            if saw_teardown {
+                crate::ui::success(&format!(
+                    "no-ack mode: got 200, withheld ACK, FS tore down after {:.1}s",
+                    waited
+                ));
+            } else {
+                crate::ui::warning(&format!(
+                    "no-ack mode: got 200, withheld ACK, no BYE observed within {:.1}s",
+                    waited
+                ));
+            }
+            if let Some(d) = self.dialog.as_mut() {
+                d.terminate();
+            }
+            self.rtp_session = None;
+            // Success: the point is to exercise FS's missing-ACK path, not to fail.
+            return Ok(0);
+        }
+
+        // Parse remote RTP media address from the 200 OK SDP offer.
+        let (remote_rtp_addr, _dtmf_pt) = parse_sdp_rtp_addr(&ok_body).ok_or_else(|| {
+            PhoneError::CallFailed("Could not parse RTP address from 200 OK SDP".into())
+        })?;
+
+        // Create the RTP session now (remote media addr came from the 200 OK).
+        let rtp_config = self.session_config("0.0.0.0:0", remote_rtp_addr);
+        let rtp_session = RtpSession::new(rtp_config).await?;
+        let rtp_port = rtp_session.local_addr().port();
+
+        // Build the SDP ANSWER (recvonly PCMU) carried in the ACK.
+        let sess_id = format!("{}", rand::random::<u32>());
+        let answer_sdp = format!(
+            "v=0\r\n\
+             o=srs {sid} {sid} IN IP4 {ip}\r\n\
+             s=siprec\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=recvonly\r\n\
+             a=label:1\r\n",
+            sid = sess_id,
+            ip = sdp_local_ip,
+            port = rtp_port,
+        );
+
+        // In-dialog ACK (CSeq 1 ACK) with the SDP answer body, routed to the
+        // 200 OK's Contact (remote target) when present, else the response source.
+        let remote_target = dialog
+            .remote_target
+            .as_deref()
+            .unwrap_or(&dialog.remote_uri)
+            .to_string();
+        let ack = RequestBuilder::new(SipMethod::Ack, &remote_target)
+            .header(
+                HeaderName::Via,
+                format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()),
+            )
+            .header(HeaderName::MaxForwards, "70")
+            .header(
+                HeaderName::From,
+                format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
+            )
+            .header(
+                HeaderName::To,
+                format!(
+                    "<{}>{}",
+                    dialog.remote_uri,
+                    dialog
+                        .remote_tag
+                        .as_ref()
+                        .map(|t| format!(";tag={}", t))
+                        .unwrap_or_default()
+                ),
+            )
+            .header(HeaderName::CallId, &dialog.call_id)
+            .header(HeaderName::CSeq, "1 ACK")
+            .header(HeaderName::ContentType, "application/sdp")
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .body(&answer_sdp)
+            .build();
+
+        let ack_dest = dialog
+            .remote_target
+            .as_deref()
+            .and_then(sip_core::transport::resolve_sip_uri)
+            .unwrap_or(ok_source);
+        self.log_sip(true, &ack);
+        self.transport.send_to(&ack, ack_dest).await?;
+
+        self.dialog = Some(dialog);
+        self.rtp_session = Some(rtp_session);
+        self.remote_sip_addr = Some(ok_source);
+        self.call_id = Some(call_id);
+        self.on_hold = false;
+
+        crate::ui::success(&format!(
+            "SIPREC session up: recording RTP from {} (local {}:{})",
+            remote_rtp_addr, sdp_local_ip, rtp_port
+        ));
+
+        // Receive + record forked RTP. SIP and RTP use separate sockets, so run
+        // a background SIP receiver (for the BYE) alongside the RTP event stream.
+        let (mut rtp_rx, _rtp_stop) = self
+            .rtp_session
+            .as_ref()
+            .unwrap()
+            .start_receiving_events(1024, None);
+        let (mut sip_rx, _sip_stop) = self.transport.start_receiving(32);
+
+        let rec_deadline = if wait_bye {
+            None
+        } else {
+            duration.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s))
+        };
+
+        let mut packets = 0usize;
+        let mut got_bye = false;
+        loop {
+            tokio::select! {
+                ev = rtp_rx.recv() => {
+                    match ev {
+                        Some(ReceiveEvent::Audio(frame)) => {
+                            packets += 1;
+                            if let Some(rec) = recorder.as_deref_mut() {
+                                rec.record_frame(&frame);
+                            }
+                        }
+                        Some(ReceiveEvent::Dtmf(_)) => {}
+                        None => break,
+                    }
+                }
+                sip = sip_rx.recv() => {
+                    let Some(incoming) = sip else { break };
+                    let msg = incoming.message;
+                    self.log_sip(false, &msg);
+                    if let Some(method) = msg.method() {
+                        if *method == SipMethod::Bye {
+                            crate::ui::event("SIPREC: remote sent BYE");
+                            if let SipMessage::Request(ref req) = msg {
+                                let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                                self.log_sip(true, &ok);
+                                let _ = self.transport.send_to(&ok, incoming.source).await;
+                            }
+                            if let Some(d) = self.dialog.as_mut() {
+                                d.process_bye(&msg);
+                            }
+                            got_bye = true;
+                            break;
+                        }
+                    }
+                }
+                _ = async {
+                    match rec_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    crate::ui::info("SIPREC: record duration elapsed, sending BYE...");
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    crate::ui::info("SIPREC: interrupted, sending BYE...");
+                    break;
+                }
+            }
+        }
+
+        // If we are the ones terminating, send a BYE and drain the 200 from the
+        // still-running background receiver (keeps the sip-log complete).
+        if !got_bye {
+            let remote_sip = self.remote_sip_addr;
+            let bye_info = self.dialog.as_mut().map(|dialog| {
+                let cseq = dialog.next_cseq();
+                let bye = build_in_dialog_request(SipMethod::Bye, dialog, &local_addr, cseq);
+                let dest = dialog
+                    .remote_target
+                    .as_deref()
+                    .and_then(sip_core::transport::resolve_sip_uri)
+                    .or(remote_sip);
+                (bye, cseq, dest)
+            });
+            if let Some((bye, cseq, Some(addr))) = bye_info {
+                self.log_sip(true, &bye);
+                self.transport.send_to(&bye, addr).await?;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let Some(incoming) = sip_rx.recv().await else { break };
+                        self.log_sip(false, &incoming.message);
+                        if incoming.message.is_response() {
+                            if let Some((got, method)) = incoming.message.cseq() {
+                                if method == SipMethod::Bye && got == cseq {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+            }
+            if let Some(dialog) = self.dialog.as_mut() {
+                dialog.terminate();
+            }
+        }
+
+        self.rtp_session = None;
+        Ok(packets)
+    }
+
     pub async fn hangup(&mut self) -> Result<(), PhoneError> {
         let sip_log = self.sip_log_path.clone();
         let remote_sip_addr = self.remote_sip_addr;
@@ -441,6 +844,23 @@ impl SoftPhone {
         if let Some(addr) = bye_dest {
             write_sip_log(sip_log.as_ref(), true, &bye);
             self.transport.send_to(&bye, addr).await?;
+            // The e2e dialog check requires the 200 to BYE in --sip-log.
+            // Recv is safe here: hangup runs after the call receive loop is dropped.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let incoming = self.transport.recv().await?;
+                    write_sip_log(sip_log.as_ref(), false, &incoming.message);
+                    if incoming.message.is_response() {
+                        if let Some((got, method)) = incoming.message.cseq() {
+                            if method == SipMethod::Bye && got == cseq {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok::<(), PhoneError>(())
+            })
+            .await;
         }
 
         dialog.terminate();
@@ -830,6 +1250,7 @@ impl SoftPhone {
                                 if let SipMessage::Request(ref req) = msg {
                                     let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
                                     debugger.capture_outgoing(&ok, local_addr, incoming.source);
+                                    write_sip_log(sip_log.as_ref(), true, &ok);
                                     let _ = self.transport.send_to(&ok, incoming.source).await;
                                 }
                                 dialog.process_bye(&msg);
