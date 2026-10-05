@@ -20,8 +20,10 @@ pub struct SiprConfig {
     pub server: Option<String>,
     /// Default SIP password (stored in plaintext)
     pub password: Option<String>,
-    /// Default audio codec: "pcmu", "pcma", or "opus"
+    /// Default audio codec: "pcmu", "pcma", "opus", or "amrwb"
     pub codec: Option<rtp_core::CodecType>,
+    /// Default AMR-WB octet-align: "1", "0", or "omit"
+    pub octet_align: Option<sip_core::OctetAlign>,
     /// Default audio input device name or index
     pub input_device: Option<String>,
     /// Default audio output device name or index
@@ -88,6 +90,7 @@ impl SiprConfig {
             server: None,
             password: None,
             codec: Some(rtp_core::CodecType::Pcmu),
+            octet_align: Some(sip_core::OctetAlign::One),
             input_device: None,
             output_device: None,
             port: Some(0),

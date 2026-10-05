@@ -62,15 +62,15 @@ enum Commands {
     #[command(
         visible_alias = "dial",
         long_about = "Initiate an outbound SIP call to the specified URI.\n\
-                            The call will use RTP for audio transport with G.711 codec.\n\
+                            The call will use RTP for audio (G.711, Opus, or AMR-WB).\n\
                             Press Ctrl+C to hang up during an active call.\n\n\
                             Examples:\n  \
                               siphone dial 1\n  \
                               siphone call sip:2234@135.125.159.46 --user 2234\n  \
                               siphone call sip:bob@example.com\n  \
-                              siphone call sip:bob@example.com --server sip.example.com --user alice\n  \
-                              siphone call sip:bob@192.168.1.100 --user alice --record call.wav\n  \
-                              siphone call sip:bob@example.com --user alice --codec pcma"
+                              siphone call sip:bob@example.com --user alice --codec pcma\n  \
+                              siphone call sip:15550200@127.0.0.1:5080 --codec amrwb --octet-align 1\n  \
+                              siphone call sip:15550200@127.0.0.1:5080 --codecs amrwb,pcmu --octet-align 0"
     )]
     Call {
         /// SIP URI to call (e.g., sip:bob@example.com)
@@ -87,9 +87,15 @@ enum Commands {
         /// Local UDP port for SIP signaling (0 = random)
         #[arg(long)]
         port: Option<u16>,
-        /// Audio codec to use: pcmu, pcma, or opus
+        /// Audio codec to use: pcmu, pcma, opus, or amrwb
         #[arg(long, value_parser = parse_codec)]
         codec: Option<rtp_core::CodecType>,
+        /// AMR-WB octet-align: 1, 0, or omit (RFC default = 0)
+        #[arg(long, value_parser = parse_octet_align)]
+        octet_align: Option<sip_core::OctetAlign>,
+        /// Ordered offer list, e.g. amrwb,pcmu or pcmu,amrwb
+        #[arg(long)]
+        codecs: Option<String>,
         /// Input audio device (microphone): "default", device index, or name substring
         #[arg(long)]
         input_device: Option<String>,
@@ -102,6 +108,24 @@ enum Commands {
         /// Enable SIP tracing from the start (sngrep-like)
         #[arg(long)]
         sniff: bool,
+        /// Bind SIP to host:port (defaults to 0.0.0.0:<port>)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Auto hang-up after N seconds (implies headless)
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Transmit a sine tone at this Hz when no microphone is available
+        #[arg(long)]
+        tone: Option<f64>,
+        /// Write SIPp-style SIP message dump (INVITE/183/200) to this path
+        #[arg(long)]
+        sip_log: Option<String>,
+        /// Skip the interactive in-call CLI (no TTY required)
+        #[arg(long)]
+        headless: bool,
+        /// AMR-WB SDP mode-set (e.g. 8 or 0,1,2)
+        #[arg(long)]
+        mode_set: Option<String>,
     },
 
     /// Listen for incoming SIP calls
@@ -125,6 +149,81 @@ enum Commands {
         /// Record received audio to a WAV file
         #[arg(long)]
         record: Option<String>,
+        /// Preferred answer codec when the offer allows it: pcmu, pcma, opus, or amrwb
+        #[arg(long, value_parser = parse_codec)]
+        codec: Option<rtp_core::CodecType>,
+        /// Comma-separated answer codecs (overrides --codec). Example: amrwb
+        #[arg(long)]
+        codecs: Option<String>,
+        /// AMR-WB octet-align when answering: 1, 0, or omit
+        #[arg(long, value_parser = parse_octet_align)]
+        octet_align: Option<sip_core::OctetAlign>,
+        /// Bind SIP to host:port (defaults to 0.0.0.0:<port>)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Auto hang-up after N seconds (implies headless)
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Transmit a sine tone at this Hz when no microphone is available
+        #[arg(long)]
+        tone: Option<f64>,
+        /// Write SIPp-style SIP message dump to this path
+        #[arg(long)]
+        sip_log: Option<String>,
+        /// Skip the interactive in-call CLI (no TTY required)
+        #[arg(long)]
+        headless: bool,
+        /// Send 183 Session Progress with SDP before 200 OK
+        #[arg(long)]
+        early_media: bool,
+        /// Codec advertised on 183 when --early-media is set (default: answered codec)
+        #[arg(long, value_parser = parse_codec)]
+        early_codec: Option<rtp_core::CodecType>,
+        /// Milliseconds to wait after 183 before sending 200 OK (0 = send 200 immediately)
+        #[arg(long, default_value_t = 0)]
+        early_delay_ms: u64,
+        /// AMR-WB SDP mode-set when answering
+        #[arg(long)]
+        mode_set: Option<String>,
+    },
+
+    /// Act as a SIPREC recorder (RFC 7866 SRS)
+    #[command(long_about = "Behave as an RFC 7866 SIPREC recording server (SRS).\n\
+                            Sends an offerless INVITE with 'Require: siprec', receives the\n\
+                            SDP offer in the 200 OK, ACKs with an SDP answer (recvonly), then\n\
+                            records the forked RTP to a WAV file. Pure headless flow.\n\n\
+                            Examples:\n  \
+                              siphone siprec sip:<uuid>@127.0.0.1:5080 --record out.wav --duration 10\n  \
+                              siphone siprec sip:<uuid>@127.0.0.1:5080 --record out.wav --wait-bye \\\n    \
+                                --sip-log srs.log --bind 127.0.0.1:6080")]
+    Siprec {
+        /// SIP URI to record (e.g., sip:<channel-uuid>@<fs-ip>:5080)
+        uri: String,
+        /// Bind SIP to host:port (defaults to 0.0.0.0:0)
+        #[arg(long)]
+        bind: Option<String>,
+        /// Seconds to record before sending BYE (ignored with --wait-bye)
+        #[arg(long)]
+        duration: Option<u64>,
+        /// Wait for FreeSWITCH to send BYE instead of sending one after --duration
+        #[arg(long)]
+        wait_bye: bool,
+        /// Record received RTP to a WAV file
+        #[arg(long)]
+        record: Option<String>,
+        /// Write SIPp-style SIP message dump to this path
+        #[arg(long)]
+        sip_log: Option<String>,
+        /// Max seconds to wait for the 200 OK (default 10)
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+        /// Error-path probe: receive the 200 OK but deliberately withhold the
+        /// ACK (no SDP answer, no RTP), then observe FS's missing-ACK teardown
+        #[arg(long)]
+        no_ack: bool,
+        /// Pure headless flow (no TTY / interactive loop)
+        #[arg(long)]
+        headless: bool,
     },
 
     /// List available audio devices
@@ -269,11 +368,89 @@ enum SpeedDialAction {
 }
 
 fn parse_codec(s: &str) -> Result<rtp_core::CodecType, String> {
-    match s.to_lowercase().as_str() {
-        "pcmu" | "ulaw" | "g711u" => Ok(rtp_core::CodecType::Pcmu),
-        "pcma" | "alaw" | "g711a" => Ok(rtp_core::CodecType::Pcma),
-        "opus" => Ok(rtp_core::CodecType::Opus),
-        _ => Err(format!("Unknown codec '{}'. Supported: pcmu, pcma, opus", s)),
+    rtp_core::CodecType::from_sdp_name(s)
+        .ok_or_else(|| format!("Unknown codec '{}'. Supported: pcmu, pcma, opus, amrwb", s))
+}
+
+fn parse_octet_align(s: &str) -> Result<sip_core::OctetAlign, String> {
+    sip_core::OctetAlign::parse_token(s)
+}
+
+fn sip_bind_addr(bind: Option<&str>, port: u16) -> String {
+    if let Some(b) = bind {
+        if b.contains(':') {
+            b.to_string()
+        } else {
+            format!("{}:{}", b, port)
+        }
+    } else {
+        format!("0.0.0.0:{}", port)
+    }
+}
+
+async fn run_call_until(
+    phone: &mut SoftPhone,
+    recorder: &mut Option<rtp_core::AudioRecorder>,
+    input_device: &str,
+    output_device: &str,
+    sniff: bool,
+    max_history: usize,
+    duration: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::select! {
+        result = phone.run_call(
+            recorder.as_mut(),
+            input_device,
+            output_device,
+            sniff,
+            max_history,
+        ) => {
+            match result {
+                Ok(_) => ui::event("Call ended"),
+                Err(e) => ui::error(&format!("Call error: {}", e)),
+            }
+        }
+        _ = async {
+            if let Some(secs) = duration {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            ui::info("Duration elapsed, hanging up...");
+            phone.hangup().await?;
+            ui::event("Call ended");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            ui::info("\nHanging up...");
+            phone.hangup().await?;
+            ui::event("Call ended");
+        }
+    }
+    Ok(())
+}
+
+fn apply_media_options(
+    phone: &mut SoftPhone,
+    codec: rtp_core::CodecType,
+    octet_align: Option<sip_core::OctetAlign>,
+    codecs: Option<&str>,
+    mode_set: Option<&str>,
+) {
+    let oa = octet_align.unwrap_or(if codec == rtp_core::CodecType::AmrWb {
+        sip_core::OctetAlign::One
+    } else {
+        sip_core::OctetAlign::Omitted
+    });
+    phone.set_octet_align(oa);
+    if let Some(list) = codecs {
+        let names: Vec<&str> = list.split(',').map(|s| s.trim()).collect();
+        phone.set_audio_offer(sip_core::AudioOffer::from_names(&names, oa));
+    } else if codec == rtp_core::CodecType::AmrWb {
+        phone.set_audio_offer(sip_core::AudioOffer::amrwb_then_g711(oa));
+    }
+    if let Some(ms) = mode_set {
+        phone.set_audio_offer(phone.audio_offer().clone().with_amrwb_mode_set(ms));
     }
 }
 
@@ -325,10 +502,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             password,
             port,
             codec,
+            octet_align,
+            codecs,
             input_device,
             output_device,
             record,
             sniff,
+            bind,
+            duration,
+            tone,
+            sip_log,
+            headless,
+            mode_set,
         } => {
             let call_uri = resolve_call_target(&cfg, &uri)?;
             // Merge: CLI > config > defaults
@@ -337,11 +522,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let password = password.or(cfg.password.clone());
             let port = port.or(cfg.port).unwrap_or(0);
             let codec = codec.or(cfg.codec).unwrap_or(rtp_core::CodecType::Pcmu);
+            let octet_align = octet_align.or(cfg.octet_align);
             let input_device = input_device.or(cfg.input_device.clone()).unwrap_or_else(|| "default".into());
             let output_device = output_device.or(cfg.output_device.clone()).unwrap_or_else(|| "default".into());
             let record = record.or(cfg.record_path.clone());
             let sniff = sniff || cfg.sniff.unwrap_or(false);
             let max_history = cfg.max_history.unwrap_or(1000);
+            let headless = headless || duration.is_some();
 
             // Report device selection
             let input_sel = DeviceSelector::from_arg(&input_device);
@@ -357,7 +544,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ui::warning("Call will proceed without live audio (RTP only).");
             }
 
-            let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
+            let mut phone = SoftPhone::new(&sip_bind_addr(bind.as_deref(), port)).await?;
+            apply_media_options(&mut phone, codec, octet_align, codecs.as_deref(), mode_set.as_deref());
+            phone.set_headless(headless);
+            phone.set_tx_tone_hz(tone);
+            phone.set_sip_log_path(sip_log.map(std::path::PathBuf::from));
             phone
                 .call(
                     &call_uri,
@@ -368,27 +559,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             ui::event(&format!("Calling {}...", call_uri));
-
-            let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
-            tokio::select! {
-                result = phone.run_call(
-                    recorder.as_mut(),
-                    &input_device,
-                    &output_device,
-                    sniff,
-                    max_history,
-                ) => {
-                    match result {
-                        Ok(_) => ui::event("Call ended"),
-                        Err(e) => ui::error(&format!("Call error: {}", e)),
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    ui::info("\nHanging up...");
-                    phone.hangup().await?;
-                    ui::event("Call ended");
-                }
+            if codec == rtp_core::CodecType::AmrWb {
+                ui::info(&format!(
+                    "Offering AMR-WB octet-align={}",
+                    octet_align.unwrap_or(sip_core::OctetAlign::One)
+                ));
             }
+
+            let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(phone.codec().clock_rate()));
+            run_call_until(
+                &mut phone,
+                &mut recorder,
+                &input_device,
+                &output_device,
+                sniff,
+                max_history,
+                duration,
+            )
+            .await?;
 
             // Save recording started with --record flag
             if let (Some(path), Some(ref rec)) = (&record, &recorder) {
@@ -420,40 +608,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             input_device,
             output_device,
             record,
+            codec,
+            codecs,
+            octet_align,
+            bind,
+            duration,
+            tone,
+            sip_log,
+            headless,
+            early_media,
+            early_codec,
+            early_delay_ms,
+            mode_set,
         } => {
             let input_device = input_device.unwrap_or_else(|| cfg.input_device.clone().unwrap_or_else(|| "default".into()));
             let output_device = output_device.unwrap_or_else(|| cfg.output_device.clone().unwrap_or_else(|| "default".into()));
             let max_history = cfg.max_history.unwrap_or(1000);
-            ui::event(&format!("Listening for incoming SIP calls on port {}...", port));
+            let headless = headless || duration.is_some();
+            let bind_addr = sip_bind_addr(bind.as_deref(), port);
+            ui::event(&format!("Listening for incoming SIP calls on {}...", bind_addr));
             if !rtp_core::audio_device::is_audio_available() {
                 ui::warning(&rtp_core::audio_device::audio_unavailable_reason());
                 ui::warning("Call will proceed without live audio (RTP only).");
             }
 
-            let mut phone = SoftPhone::new(&format!("0.0.0.0:{}", port)).await?;
+            let mut phone = SoftPhone::new(&bind_addr).await?;
+            if codecs.is_some() || codec.or(cfg.codec).is_some() {
+                let c = codec.or(cfg.codec).unwrap_or(rtp_core::CodecType::AmrWb);
+                apply_media_options(&mut phone, c, octet_align.or(cfg.octet_align), codecs.as_deref(), mode_set.as_deref());
+            }
+            phone.set_headless(headless);
+            phone.set_tx_tone_hz(tone);
+            phone.set_sip_log_path(sip_log.map(std::path::PathBuf::from));
+            phone.set_early_media(early_media);
+            phone.set_early_codec(early_codec);
+            phone.set_early_delay_ms(early_delay_ms);
             phone.accept_call(timeout).await?;
             ui::success("Call accepted!");
 
-            let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(8000));
-            tokio::select! {
-                result = phone.run_call(
-                    recorder.as_mut(),
-                    &input_device,
-                    &output_device,
-                    false,
-                    max_history,
-                ) => {
-                    match result {
-                        Ok(_) => ui::event("Call ended"),
-                        Err(e) => ui::error(&format!("Call error: {}", e)),
-                    }
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    ui::info("\nHanging up...");
-                    phone.hangup().await?;
-                    ui::event("Call ended");
-                }
-            }
+            let mut recorder = record.as_ref().map(|_| rtp_core::AudioRecorder::new(phone.codec().clock_rate()));
+            run_call_until(
+                &mut phone,
+                &mut recorder,
+                &input_device,
+                &output_device,
+                false,
+                max_history,
+                duration,
+            )
+            .await?;
 
             if let (Some(path), Some(ref rec)) = (&record, &recorder) {
                 if rec.frame_count() > 0 {
@@ -462,6 +665,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             path, rec.duration_ms() as f64 / 1000.0, rec.frame_count())),
                         Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
                     }
+                }
+            }
+        }
+        Commands::Siprec {
+            uri,
+            bind,
+            duration,
+            wait_bye,
+            record,
+            sip_log,
+            timeout,
+            no_ack,
+            headless: _headless,
+        } => {
+            let bind_addr = sip_bind_addr(bind.as_deref(), 0);
+            ui::event(&format!("SIPREC recorder binding on {}...", bind_addr));
+            if no_ack {
+                ui::warning("no-ack mode: ACK will be withheld (FS missing-ACK teardown probe)");
+            } else if let Some(ref path) = record {
+                ui::status(&format!("Recording to: {}", path));
+            }
+
+            let mut phone = SoftPhone::new(&bind_addr).await?;
+            phone.set_headless(true);
+            phone.set_sip_log_path(sip_log.map(std::path::PathBuf::from));
+
+            // SIPREC leg records PCMU/8000; recorder matches that clock rate.
+            let mut recorder = if no_ack {
+                None
+            } else {
+                record
+                    .as_ref()
+                    .map(|_| rtp_core::AudioRecorder::new(rtp_core::CodecType::Pcmu.clock_rate()))
+            };
+
+            let result = phone
+                .siprec_record(&uri, recorder.as_mut(), duration, wait_bye, timeout, no_ack)
+                .await;
+
+            match result {
+                Ok(_) if no_ack => {
+                    // Probe succeeded as long as the 200 OK was received; the whole
+                    // point is to exercise FS's missing-ACK path, not to fail.
+                    ui::success("SIPREC no-ack probe complete (200 received, ACK withheld)");
+                }
+                Ok(packets) => {
+                    let wav_path = record.as_deref().unwrap_or("(none)");
+                    if let (Some(path), Some(ref rec)) = (&record, &recorder) {
+                        if rec.frame_count() > 0 {
+                            match rec.save_wav(path) {
+                                Ok(_) => ui::success(&format!(
+                                    "Saved recording to {} ({:.1}s, {} frames)",
+                                    path,
+                                    rec.duration_ms() as f64 / 1000.0,
+                                    rec.frame_count()
+                                )),
+                                Err(e) => ui::error(&format!("Failed to save recording: {}", e)),
+                            }
+                        } else {
+                            ui::info("No RTP frames received, recording not saved.");
+                        }
+                    }
+                    ui::success(&format!(
+                        "SIPREC complete: {} RTP packets received, WAV: {}",
+                        packets, wav_path
+                    ));
+                    if packets == 0 {
+                        return Err("SIPREC failed: no RTP received".into());
+                    }
+                }
+                Err(e) => {
+                    ui::error(&format!("SIPREC failed: {}", e));
+                    return Err(e.into());
                 }
             }
         }

@@ -109,6 +109,23 @@ impl AudioConfig {
     pub fn samples_per_frame(&self) -> usize {
         (self.sample_rate as usize * self.frame_size_ms as usize) / 1000
     }
+
+    /// Wideband capture/playback (AMR-WB / 16 kHz).
+    pub fn wideband() -> Self {
+        Self {
+            sample_rate: 16000,
+            channels: 1,
+            frame_size_ms: 20,
+        }
+    }
+
+    pub fn for_clock_rate(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            channels: 1,
+            frame_size_ms: 20,
+        }
+    }
 }
 
 impl Default for AudioConfig {

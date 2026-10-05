@@ -6,12 +6,13 @@ use rtp_core::{AudioRecorder, CodecType, ReceiveEvent, RtpSession, SessionConfig
 use sip_core::auth::{self, Credentials};
 use sip_core::header::{generate_branch, generate_tag, HeaderName};
 use sip_core::message::{RequestBuilder, ResponseBuilder, SipMessage, SipMethod, StatusCode};
-use sip_core::sdp::SdpSession;
+use sip_core::sdp::{AudioOffer, OctetAlign, SdpSession};
 use sip_core::dialog::SipDialog;
 use sip_core::transport::SipTransport;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -59,6 +60,17 @@ pub struct SoftPhone {
     server_host: Option<String>,
     /// Stored user for re-registration after auth challenge.
     reg_user: Option<String>,
+    audio_offer: AudioOffer,
+    octet_align: OctetAlign,
+    rtp_codec: CodecType,
+    headless: bool,
+    tx_tone_hz: Option<f64>,
+    sip_log_path: Option<PathBuf>,
+    early_media: bool,
+    early_codec: Option<CodecType>,
+    early_delay_ms: u64,
+    pending_invite: Option<SipMessage>,
+    answer_sdp_body: Option<String>,
 }
 
 impl SoftPhone {
@@ -93,6 +105,17 @@ impl SoftPhone {
             on_hold: false,
             server_host: None,
             reg_user: None,
+            audio_offer: AudioOffer::g711_opus(),
+            octet_align: OctetAlign::One,
+            rtp_codec: CodecType::Pcmu,
+            headless: false,
+            tx_tone_hz: None,
+            sip_log_path: None,
+            early_media: false,
+            early_codec: None,
+            early_delay_ms: 0,
+            pending_invite: None,
+            answer_sdp_body: None,
         })
     }
 
@@ -102,6 +125,61 @@ impl SoftPhone {
             username: username.to_string(),
             password: password.to_string(),
         });
+    }
+
+    pub fn set_audio_offer(&mut self, offer: AudioOffer) {
+        self.audio_offer = offer;
+        if let Some(name) = self.audio_offer.primary_name() {
+            if let Some(codec) = CodecType::from_sdp_name(name) {
+                self.rtp_codec = codec;
+            }
+        }
+        self.octet_align = self.audio_offer.octet_align();
+    }
+
+    pub fn set_octet_align(&mut self, octet_align: OctetAlign) {
+        self.octet_align = octet_align;
+    }
+
+    pub fn codec(&self) -> CodecType {
+        self.rtp_codec
+    }
+
+    pub fn audio_offer(&self) -> &AudioOffer {
+        &self.audio_offer
+    }
+
+    pub fn set_headless(&mut self, headless: bool) {
+        self.headless = headless;
+    }
+
+    pub fn set_tx_tone_hz(&mut self, hz: Option<f64>) {
+        self.tx_tone_hz = hz;
+    }
+
+    pub fn set_sip_log_path(&mut self, path: Option<PathBuf>) {
+        self.sip_log_path = path;
+    }
+
+    pub fn set_early_media(&mut self, early_media: bool) {
+        self.early_media = early_media;
+    }
+
+    pub fn set_early_codec(&mut self, codec: Option<CodecType>) {
+        self.early_codec = codec;
+    }
+
+    pub fn set_early_delay_ms(&mut self, ms: u64) {
+        self.early_delay_ms = ms;
+    }
+
+    fn log_sip(&self, sent: bool, msg: &SipMessage) {
+        write_sip_log(self.sip_log_path.as_ref(), sent, msg);
+    }
+
+    fn session_config(&self, local_addr: &str, remote: SocketAddr) -> SessionConfig {
+        SessionConfig::new(local_addr, remote, self.rtp_codec)
+            .with_octet_align(rtp_octet_align(self.octet_align))
     }
 
     pub async fn register(
@@ -237,6 +315,15 @@ impl SoftPhone {
         password: Option<&str>,
         codec: CodecType,
     ) -> Result<(), PhoneError> {
+        self.rtp_codec = codec;
+        if self.audio_offer.primary_name() != Some(codec.name()) {
+            self.audio_offer = match codec {
+                CodecType::AmrWb => AudioOffer::amrwb_then_g711(self.octet_align),
+                CodecType::Pcma => AudioOffer::from_names(&["pcma"], self.octet_align),
+                CodecType::Opus => AudioOffer::from_names(&["opus"], self.octet_align),
+                CodecType::Pcmu => AudioOffer::g711_opus(),
+            };
+        }
         let target_uri = if uri.starts_with("sip:") {
             uri.to_string()
         } else {
@@ -267,7 +354,7 @@ impl SoftPhone {
 
         // Create RTP session for audio
         let rtp_remote = resolve_server_addr(&server_host).await?;
-        let rtp_config = SessionConfig::new("0.0.0.0:0", rtp_remote, codec);
+        let rtp_config = self.session_config("0.0.0.0:0", rtp_remote);
         let rtp_session = RtpSession::new(rtp_config).await?;
         let rtp_port = rtp_session.local_addr().port();
 
@@ -283,9 +370,8 @@ impl SoftPhone {
             if probe == "0.0.0.0" { self.local_ip.clone() } else { probe }
         };
 
-        // Build SDP offer
         let mut sdp = SdpSession::new(&sdp_local_ip);
-        sdp.add_audio_media(rtp_port);
+        sdp.add_audio_media_offer(rtp_port, &self.audio_offer);
         self.local_dtmf_payload_type = sdp.get_audio_dtmf_payload_type().unwrap_or(101);
         self.remote_dtmf_payload_type = None;
         self.dtmf_queue.clear();
@@ -318,6 +404,7 @@ impl SoftPhone {
             .build();
 
         let server_addr = resolve_server_addr(&server_host).await?;
+        self.log_sip(true, &request);
         self.transport.send_to(&request, server_addr).await?;
 
         // Create dialog
@@ -337,7 +424,412 @@ impl SoftPhone {
         Ok(())
     }
 
+    /// Act as an RFC 7866 SIPREC recorder (SRS).
+    ///
+    /// Sends an *offerless* INVITE with `Require: siprec`, waits for the 200 OK
+    /// whose body carries the SDP OFFER (sendonly) from FreeSWITCH, then sends an
+    /// ACK carrying the SDP ANSWER (recvonly). The forked RTP is received and
+    /// recorded into `recorder`. Returns the number of RTP audio frames received.
+    ///
+    /// Termination: when `wait_bye` is true the recorder blocks until FreeSWITCH
+    /// sends a BYE (replying 200). Otherwise it records for `duration` seconds
+    /// (or until Ctrl+C), then sends a BYE and waits briefly for its 200.
+    ///
+    /// When `no_ack` is true this is an error-path probe: it sends the offerless
+    /// INVITE, receives the 200 OK, but deliberately withholds the ACK (no SDP
+    /// answer, no RTP). It then waits up to `timeout_secs` to observe how
+    /// FreeSWITCH tears the dialog down, reports what it saw, and returns 0.
+    ///
+    /// This path uses no audio-device/cpal types and works fully headless.
+    pub async fn siprec_record(
+        &mut self,
+        uri: &str,
+        mut recorder: Option<&mut AudioRecorder>,
+        duration: Option<u64>,
+        wait_bye: bool,
+        timeout_secs: u64,
+        no_ack: bool,
+    ) -> Result<usize, PhoneError> {
+        // SIPREC recording leg is PCMU/8000 (what FreeSWITCH offers/forks).
+        self.rtp_codec = CodecType::Pcmu;
+        self.octet_align = OctetAlign::Omitted;
+
+        let target_uri = if uri.starts_with("sip:") {
+            uri.to_string()
+        } else {
+            format!("sip:{}", uri)
+        };
+        let server_host = extract_host_from_uri(&target_uri).ok_or_else(|| {
+            PhoneError::CallFailed(
+                "Cannot extract server from URI; use sip:user@host[:port] format".into(),
+            )
+        })?;
+        let server_addr = resolve_server_addr(&server_host).await?;
+
+        let call_id = Uuid::new_v4().to_string();
+        let branch = generate_branch();
+        let local_addr = self.transport.local_addr();
+
+        // Detect the real outbound IP for the SDP answer by probing the server.
+        let sdp_local_ip = {
+            let probe = std::net::UdpSocket::bind("0.0.0.0:0")
+                .ok()
+                .and_then(|s| {
+                    let _ = s.connect(server_addr);
+                    s.local_addr().ok()
+                })
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| self.local_ip.clone());
+            if probe == "0.0.0.0" {
+                self.local_ip.clone()
+            } else {
+                probe
+            }
+        };
+
+        // Offerless INVITE: no SDP body (Content-Length: 0), Require/Supported siprec,
+        // and an SRS Contact tagged with the +sip.srs feature parameter.
+        let invite = RequestBuilder::new(SipMethod::Invite, &target_uri)
+            .header(
+                HeaderName::Via,
+                format!("SIP/2.0/UDP {};branch={};rport", local_addr, branch),
+            )
+            .header(HeaderName::MaxForwards, "70")
+            .header(
+                HeaderName::From,
+                format!("<sip:srs@{}>;tag={}", server_host, self.local_tag),
+            )
+            .header(HeaderName::To, format!("<{}>", target_uri))
+            .header(HeaderName::CallId, &call_id)
+            .header(HeaderName::CSeq, "1 INVITE")
+            .header(HeaderName::Contact, format!("<sip:srs@{}>;+sip.srs", local_addr))
+            .header(HeaderName::Require, "siprec")
+            .header(HeaderName::Supported, "siprec")
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .build();
+
+        self.log_sip(true, &invite);
+        self.transport.send_to(&invite, server_addr).await?;
+
+        let mut dialog = SipDialog::new_uac(
+            call_id.clone(),
+            self.local_tag.clone(),
+            format!("sip:srs@{}", server_host),
+            target_uri.clone(),
+        );
+
+        // Wait for the 200 OK (skipping 1xx). Its body is the SDP OFFER.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let (ok_body, ok_source) = loop {
+            let incoming = tokio::time::timeout_at(deadline, self.transport.recv())
+                .await
+                .map_err(|_| PhoneError::CallFailed("Timed out waiting for 200 OK".into()))?
+                .map_err(PhoneError::Transport)?;
+            let msg = incoming.message;
+            self.log_sip(false, &msg);
+            if !msg.is_response() {
+                continue;
+            }
+            dialog.process_response(&msg);
+            let Some(status) = msg.status() else { continue };
+            if status.is_provisional() {
+                crate::ui::info(&format!(
+                    "SIPREC progress: {} {}",
+                    status,
+                    status.reason_phrase()
+                ));
+                continue;
+            } else if status.is_success() {
+                let body = msg
+                    .body()
+                    .map(|b| b.to_string())
+                    .ok_or_else(|| PhoneError::CallFailed("200 OK had no SDP offer".into()))?;
+                break (body, incoming.source);
+            } else {
+                // Non-2xx final: ACK then fail.
+                let ack = build_ack_msg(&dialog, &local_addr);
+                self.log_sip(true, &ack);
+                let _ = self.transport.send_to(&ack, incoming.source).await;
+                return Err(PhoneError::CallFailed(format!(
+                    "SIPREC INVITE rejected: {} {}",
+                    status,
+                    status.reason_phrase()
+                )));
+            }
+        };
+
+        // Error-path probe: got the 200 OK, now deliberately withhold the ACK
+        // (no SDP answer, no RTP) and observe how FreeSWITCH tears the dialog
+        // down (it will time out waiting for the ACK and BYE / re-send the 200).
+        if no_ack {
+            crate::ui::warning("no-ack mode: received 200 OK, withholding ACK (no SDP answer, no RTP)");
+            self.dialog = Some(dialog);
+            self.remote_sip_addr = Some(ok_source);
+            self.call_id = Some(call_id);
+
+            let probe_start = tokio::time::Instant::now();
+            let probe_deadline = probe_start + std::time::Duration::from_secs(timeout_secs);
+            let mut saw_teardown = false;
+            loop {
+                let remaining = probe_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, self.transport.recv()).await {
+                    Ok(Ok(incoming)) => {
+                        let msg = incoming.message;
+                        self.log_sip(false, &msg);
+                        let elapsed = probe_start.elapsed().as_secs_f64();
+                        if let Some(method) = msg.method() {
+                            if *method == SipMethod::Bye {
+                                crate::ui::event(&format!(
+                                    "no-ack mode: FS sent BYE after {:.1}s; replying 200",
+                                    elapsed
+                                ));
+                                if let SipMessage::Request(ref req) = msg {
+                                    let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                                    self.log_sip(true, &ok);
+                                    let _ = self.transport.send_to(&ok, incoming.source).await;
+                                }
+                                if let Some(d) = self.dialog.as_mut() {
+                                    d.process_bye(&msg);
+                                }
+                                saw_teardown = true;
+                                break;
+                            } else {
+                                crate::ui::info(&format!(
+                                    "no-ack mode: received {} after {:.1}s",
+                                    method, elapsed
+                                ));
+                            }
+                        } else if let Some(status) = msg.status() {
+                            // FS retransmits the 200 OK while waiting for the ACK.
+                            crate::ui::info(&format!(
+                                "no-ack mode: received {} {} (retransmit) after {:.1}s",
+                                status,
+                                status.reason_phrase(),
+                                elapsed
+                            ));
+                        }
+                    }
+                    Ok(Err(e)) => return Err(PhoneError::Transport(e)),
+                    Err(_) => break, // timed out
+                }
+            }
+
+            let waited = probe_start.elapsed().as_secs_f64();
+            if saw_teardown {
+                crate::ui::success(&format!(
+                    "no-ack mode: got 200, withheld ACK, FS tore down after {:.1}s",
+                    waited
+                ));
+            } else {
+                crate::ui::warning(&format!(
+                    "no-ack mode: got 200, withheld ACK, no BYE observed within {:.1}s",
+                    waited
+                ));
+            }
+            if let Some(d) = self.dialog.as_mut() {
+                d.terminate();
+            }
+            self.rtp_session = None;
+            // Success: the point is to exercise FS's missing-ACK path, not to fail.
+            return Ok(0);
+        }
+
+        // Parse remote RTP media address from the 200 OK SDP offer.
+        let (remote_rtp_addr, _dtmf_pt) = parse_sdp_rtp_addr(&ok_body).ok_or_else(|| {
+            PhoneError::CallFailed("Could not parse RTP address from 200 OK SDP".into())
+        })?;
+
+        // Create the RTP session now (remote media addr came from the 200 OK).
+        let rtp_config = self.session_config("0.0.0.0:0", remote_rtp_addr);
+        let rtp_session = RtpSession::new(rtp_config).await?;
+        let rtp_port = rtp_session.local_addr().port();
+
+        // Build the SDP ANSWER (recvonly PCMU) carried in the ACK.
+        let sess_id = format!("{}", rand::random::<u32>());
+        let answer_sdp = format!(
+            "v=0\r\n\
+             o=srs {sid} {sid} IN IP4 {ip}\r\n\
+             s=siprec\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=recvonly\r\n\
+             a=label:1\r\n",
+            sid = sess_id,
+            ip = sdp_local_ip,
+            port = rtp_port,
+        );
+
+        // In-dialog ACK (CSeq 1 ACK) with the SDP answer body, routed to the
+        // 200 OK's Contact (remote target) when present, else the response source.
+        let remote_target = dialog
+            .remote_target
+            .as_deref()
+            .unwrap_or(&dialog.remote_uri)
+            .to_string();
+        let ack = RequestBuilder::new(SipMethod::Ack, &remote_target)
+            .header(
+                HeaderName::Via,
+                format!("SIP/2.0/UDP {};branch={};rport", local_addr, generate_branch()),
+            )
+            .header(HeaderName::MaxForwards, "70")
+            .header(
+                HeaderName::From,
+                format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
+            )
+            .header(
+                HeaderName::To,
+                format!(
+                    "<{}>{}",
+                    dialog.remote_uri,
+                    dialog
+                        .remote_tag
+                        .as_ref()
+                        .map(|t| format!(";tag={}", t))
+                        .unwrap_or_default()
+                ),
+            )
+            .header(HeaderName::CallId, &dialog.call_id)
+            .header(HeaderName::CSeq, "1 ACK")
+            .header(HeaderName::ContentType, "application/sdp")
+            .header(HeaderName::UserAgent, "siphone/0.1.0")
+            .body(&answer_sdp)
+            .build();
+
+        let ack_dest = dialog
+            .remote_target
+            .as_deref()
+            .and_then(sip_core::transport::resolve_sip_uri)
+            .unwrap_or(ok_source);
+        self.log_sip(true, &ack);
+        self.transport.send_to(&ack, ack_dest).await?;
+
+        self.dialog = Some(dialog);
+        self.rtp_session = Some(rtp_session);
+        self.remote_sip_addr = Some(ok_source);
+        self.call_id = Some(call_id);
+        self.on_hold = false;
+
+        crate::ui::success(&format!(
+            "SIPREC session up: recording RTP from {} (local {}:{})",
+            remote_rtp_addr, sdp_local_ip, rtp_port
+        ));
+
+        // Receive + record forked RTP. SIP and RTP use separate sockets, so run
+        // a background SIP receiver (for the BYE) alongside the RTP event stream.
+        let (mut rtp_rx, _rtp_stop) = self
+            .rtp_session
+            .as_ref()
+            .unwrap()
+            .start_receiving_events(1024, None);
+        let (mut sip_rx, _sip_stop) = self.transport.start_receiving(32);
+
+        let rec_deadline = if wait_bye {
+            None
+        } else {
+            duration.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s))
+        };
+
+        let mut packets = 0usize;
+        let mut got_bye = false;
+        loop {
+            tokio::select! {
+                ev = rtp_rx.recv() => {
+                    match ev {
+                        Some(ReceiveEvent::Audio(frame)) => {
+                            packets += 1;
+                            if let Some(rec) = recorder.as_deref_mut() {
+                                rec.record_frame(&frame);
+                            }
+                        }
+                        Some(ReceiveEvent::Dtmf(_)) => {}
+                        None => break,
+                    }
+                }
+                sip = sip_rx.recv() => {
+                    let Some(incoming) = sip else { break };
+                    let msg = incoming.message;
+                    self.log_sip(false, &msg);
+                    if let Some(method) = msg.method() {
+                        if *method == SipMethod::Bye {
+                            crate::ui::event("SIPREC: remote sent BYE");
+                            if let SipMessage::Request(ref req) = msg {
+                                let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
+                                self.log_sip(true, &ok);
+                                let _ = self.transport.send_to(&ok, incoming.source).await;
+                            }
+                            if let Some(d) = self.dialog.as_mut() {
+                                d.process_bye(&msg);
+                            }
+                            got_bye = true;
+                            break;
+                        }
+                    }
+                }
+                _ = async {
+                    match rec_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    crate::ui::info("SIPREC: record duration elapsed, sending BYE...");
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    crate::ui::info("SIPREC: interrupted, sending BYE...");
+                    break;
+                }
+            }
+        }
+
+        // If we are the ones terminating, send a BYE and drain the 200 from the
+        // still-running background receiver (keeps the sip-log complete).
+        if !got_bye {
+            let remote_sip = self.remote_sip_addr;
+            let bye_info = self.dialog.as_mut().map(|dialog| {
+                let cseq = dialog.next_cseq();
+                let bye = build_in_dialog_request(SipMethod::Bye, dialog, &local_addr, cseq);
+                let dest = dialog
+                    .remote_target
+                    .as_deref()
+                    .and_then(sip_core::transport::resolve_sip_uri)
+                    .or(remote_sip);
+                (bye, cseq, dest)
+            });
+            if let Some((bye, cseq, Some(addr))) = bye_info {
+                self.log_sip(true, &bye);
+                self.transport.send_to(&bye, addr).await?;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let Some(incoming) = sip_rx.recv().await else { break };
+                        self.log_sip(false, &incoming.message);
+                        if incoming.message.is_response() {
+                            if let Some((got, method)) = incoming.message.cseq() {
+                                if method == SipMethod::Bye && got == cseq {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+            }
+            if let Some(dialog) = self.dialog.as_mut() {
+                dialog.terminate();
+            }
+        }
+
+        self.rtp_session = None;
+        Ok(packets)
+    }
+
     pub async fn hangup(&mut self) -> Result<(), PhoneError> {
+        let sip_log = self.sip_log_path.clone();
+        let remote_sip_addr = self.remote_sip_addr;
         let dialog = self.dialog.as_mut().ok_or(PhoneError::NoDialog)?;
 
         let local_addr = self.transport.local_addr();
@@ -348,9 +840,27 @@ impl SoftPhone {
         // Send BYE to remote: try Contact URI first, fall back to remote SIP addr
         let bye_dest = dialog.remote_target.as_deref()
             .and_then(sip_core::transport::resolve_sip_uri)
-            .or(self.remote_sip_addr);
+            .or(remote_sip_addr);
         if let Some(addr) = bye_dest {
+            write_sip_log(sip_log.as_ref(), true, &bye);
             self.transport.send_to(&bye, addr).await?;
+            // The e2e dialog check requires the 200 to BYE in --sip-log.
+            // Recv is safe here: hangup runs after the call receive loop is dropped.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let incoming = self.transport.recv().await?;
+                    write_sip_log(sip_log.as_ref(), false, &incoming.message);
+                    if incoming.message.is_response() {
+                        if let Some((got, method)) = incoming.message.cseq() {
+                            if method == SipMethod::Bye && got == cseq {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok::<(), PhoneError>(())
+            })
+            .await;
         }
 
         dialog.terminate();
@@ -388,10 +898,14 @@ impl SoftPhone {
             crate::ui::status("SIP tracing enabled. All SIP messages will be displayed.");
         }
         let local_addr = self.transport.local_addr();
-        let audio_config = AudioConfig::telephony();
+        let audio_config = AudioConfig::for_clock_rate(self.rtp_codec.clock_rate());
         let input_sel = DeviceSelector::from_arg(input_device);
         let output_sel = DeviceSelector::from_arg(output_device);
-        let (mut cmd_rx, cmd_stop_tx) = start_interactive_command_reader(max_history);
+        let (mut cmd_rx, cmd_stop_tx) = if self.headless {
+            start_headless_command_reader()
+        } else {
+            start_interactive_command_reader(max_history)
+        };
 
         #[cfg(feature = "audio-device")]
         let mut mic_capture: Option<rtp_core::audio_device::AudioCapture> = None;
@@ -430,11 +944,63 @@ impl SoftPhone {
         } else {
             crate::ui::info("No live audio device available; RTP will run without local playback/capture.");
         }
-        crate::ui::info("Type 'help' for interactive commands. Press Ctrl+R for history search. Press Ctrl+C to hang up.");
+        if self.headless {
+            crate::ui::info("Headless call: no interactive CLI (Ctrl+C or --duration to hang up).");
+        } else {
+            crate::ui::info("Type 'help' for interactive commands. Press Ctrl+R for history search. Press Ctrl+C to hang up.");
+        }
+        let tone_clock = self
+            .rtp_session
+            .as_ref()
+            .map(|r| r.codec().codec_type().clock_rate())
+            .unwrap_or_else(|| self.rtp_codec.clock_rate());
+        let mut tone_gen = self.tx_tone_hz.map(|hz| {
+            rtp_core::audio_device::TestToneGenerator::new(hz, tone_clock, 12000)
+        });
+
+        // UAS accept_call already created the RTP session (and sent 183/200).
+        // Start the receive loop and TX ticks without waiting for a 200 OK.
+        if self.rtp_session.is_some() {
+            if let Some(ref mut rtp) = self.rtp_session {
+                if rtp_event_rx.is_none() {
+                    let (erx, stx) =
+                        rtp.start_receiving_events(1024, self.remote_dtmf_payload_type);
+                    rtp_event_rx = Some(erx);
+                    rtp_stop_tx = Some(stx);
+                }
+            }
+            rtp_connected = true;
+            crate::ui::status("RTP session already up; audio TX/RX enabled.");
+        }
+
+        let mut send_delayed_200 = self.pending_invite.is_some() && self.early_delay_ms > 0;
+        let delayed_200_deadline = if send_delayed_200 {
+            Some(tokio::time::Instant::now() + std::time::Duration::from_millis(self.early_delay_ms))
+        } else {
+            None
+        };
 
         loop {
             tokio::select! {
                 biased;
+
+                _ = async {
+                    if let Some(deadline) = delayed_200_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if send_delayed_200 => {
+                    send_delayed_200 = false;
+                    self.send_pending_200().await?;
+                    tone_gen = self.tx_tone_hz.map(|hz| {
+                        rtp_core::audio_device::TestToneGenerator::new(
+                            hz,
+                            self.rtp_codec.clock_rate(),
+                            12000,
+                        )
+                    });
+                }
 
                 // Prioritize draining audio to prevent channel backpressure
                 audio = async {
@@ -518,6 +1084,8 @@ impl SoftPhone {
                 sip_msg = rx.recv() => {
                     let Some(incoming) = sip_msg else { break };
                     let msg = incoming.message;
+                    let sip_log = self.sip_log_path.clone();
+                    self.log_sip(false, &msg);
 
                     // Feed to SIP debugger if sniffing
                     debugger.capture_incoming(&msg, incoming.source, local_addr);
@@ -563,27 +1131,44 @@ impl SoftPhone {
                                     // 183 Session Progress with SDP = early media
                                     if status.0 == 183 {
                                         if let Some(body) = msg.body() {
+                                            if let Some(codec) = sdp_primary_codec(body) {
+                                                self.rtp_codec = codec;
+                                                if let Some(ref mut rtp) = self.rtp_session {
+                                                    rtp.set_codec(codec);
+                                                }
+                                                tone_gen = self.tx_tone_hz.map(|hz| {
+                                                    rtp_core::audio_device::TestToneGenerator::new(
+                                                        hz,
+                                                        codec.clock_rate(),
+                                                        12000,
+                                                    )
+                                                });
+                                                crate::ui::status(&format!(
+                                                    "Negotiated codec from 183: {}",
+                                                    codec
+                                                ));
+                                            }
                                             if let Some((addr, dtmf_pt)) = parse_sdp_rtp_addr(body) {
                                                 self.remote_dtmf_payload_type = dtmf_pt;
-                                                if rtp_event_rx.is_none() {
-                                                    if let Some(ref mut rtp) = self.rtp_session {
-                                                        rtp.set_remote_addr(addr);
-                                                        crate::ui::status(&format!("Early media: RTP remote {}", addr));
-                                                        let call_id = dialog.call_id.clone();
-                                                        debugger.capture_rtp_event(
-                                                            &call_id,
-                                                            rtp.local_addr(),
-                                                            addr,
-                                                            "Early media RTP announced (183)",
-                                                        );
+                                                if let Some(ref mut rtp) = self.rtp_session {
+                                                    rtp.set_remote_addr(addr);
+                                                    crate::ui::status(&format!("Early media: RTP remote {}", addr));
+                                                    let call_id = dialog.call_id.clone();
+                                                    debugger.capture_rtp_event(
+                                                        &call_id,
+                                                        rtp.local_addr(),
+                                                        addr,
+                                                        "Early media RTP announced (183)",
+                                                    );
+                                                    if rtp_event_rx.is_none() {
                                                         let (erx, stx) = rtp.start_receiving_events(
                                                             1024,
                                                             self.remote_dtmf_payload_type,
                                                         );
                                                         rtp_event_rx = Some(erx);
                                                         rtp_stop_tx = Some(stx);
-                                                        rtp_connected = true;
                                                     }
+                                                    rtp_connected = true;
                                                 }
                                             }
                                         }
@@ -594,6 +1179,23 @@ impl SoftPhone {
 
                                     // Parse SDP from response to get remote RTP addr
                                     if let Some(body) = msg.body() {
+                                        if let Some(codec) = sdp_primary_codec(body) {
+                                            self.rtp_codec = codec;
+                                            if let Some(ref mut rtp) = self.rtp_session {
+                                                rtp.set_codec(codec);
+                                            }
+                                            tone_gen = self.tx_tone_hz.map(|hz| {
+                                                rtp_core::audio_device::TestToneGenerator::new(
+                                                    hz,
+                                                    codec.clock_rate(),
+                                                    12000,
+                                                )
+                                            });
+                                            crate::ui::status(&format!(
+                                                "Negotiated codec from 200: {}",
+                                                codec
+                                            ));
+                                        }
                                         if let Some((addr, dtmf_pt)) = parse_sdp_rtp_addr(body) {
                                             self.remote_dtmf_payload_type = dtmf_pt;
                                             if let Some(pt) = dtmf_pt {
@@ -626,6 +1228,7 @@ impl SoftPhone {
                                     // Send ACK
                                     let ack = build_ack_msg(dialog, &self.transport.local_addr());
                                     debugger.capture_outgoing(&ack, local_addr, incoming.source);
+                                    write_sip_log(sip_log.as_ref(), true, &ack);
                                     self.transport.send_to(&ack, incoming.source).await?;
                                 } else if status.is_error() {
                                     crate::ui::error(&format!("Call failed: {} {}", status, status.reason_phrase()));
@@ -647,6 +1250,7 @@ impl SoftPhone {
                                 if let SipMessage::Request(ref req) = msg {
                                     let ok = ResponseBuilder::from_request(req, StatusCode::OK).build();
                                     debugger.capture_outgoing(&ok, local_addr, incoming.source);
+                                    write_sip_log(sip_log.as_ref(), true, &ok);
                                     let _ = self.transport.send_to(&ok, incoming.source).await;
                                 }
                                 dialog.process_bye(&msg);
@@ -692,7 +1296,10 @@ impl SoftPhone {
                                 if let SipMessage::Request(ref req) = msg {
                                     let rtp_port = self.rtp_session.as_ref().map(|r| r.local_addr().port()).unwrap_or(0);
                                     let mut sdp = SdpSession::new(&self.local_ip);
-                                    sdp.add_audio_media(rtp_port);
+                                    sdp.add_audio_media_offer(
+                                        rtp_port,
+                                        &self.audio_offer.clone().with_direction("sendrecv"),
+                                    );
                                     let sdp_body = sdp.to_string();
                                     let ok = ResponseBuilder::from_request(req, StatusCode::OK)
                                         .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
@@ -771,7 +1378,7 @@ impl SoftPhone {
                                     } else {
                                         // Create a new recorder on the fly
                                         self.pending_record_path = Some(parts[1].to_string());
-                                        live_recorder = Some(AudioRecorder::new(8000));
+                                        live_recorder = Some(AudioRecorder::new(self.rtp_codec.clock_rate()));
                                         recording_active = true;
                                         crate::ui::status(&format!("Recording to: {}", parts[1]));
                                     }
@@ -1035,7 +1642,14 @@ impl SoftPhone {
                                 }
                             }
                         }
-                        let frame = tx_frame.unwrap_or_else(|| vec![0i16; 160]);
+                        let spf = rtp.codec().codec_type().samples_per_frame();
+                        let frame = tx_frame.unwrap_or_else(|| {
+                            if let Some(ref mut gen) = tone_gen {
+                                gen.next_frame(spf)
+                            } else {
+                                vec![0i16; spf]
+                            }
+                        });
                         if let Ok(sent) = rtp.send_audio(&frame).await {
                             if !announced_audio_tx && sent > 0 {
                                 let s = rtp.stats();
@@ -1199,7 +1813,7 @@ impl SoftPhone {
 
         let rtp_port = self.rtp_session.as_ref().map(|r| r.local_addr().port()).unwrap_or(0);
         let mut sdp = SdpSession::new(&self.local_ip);
-        sdp.add_audio_media_directed(rtp_port, "sendonly");
+        sdp.add_audio_media_offer(rtp_port, &self.audio_offer.clone().with_direction("sendonly"));
         let sdp_body = sdp.to_string();
 
         let reinvite = RequestBuilder::new(SipMethod::Invite, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
@@ -1233,7 +1847,7 @@ impl SoftPhone {
 
         let rtp_port = self.rtp_session.as_ref().map(|r| r.local_addr().port()).unwrap_or(0);
         let mut sdp = SdpSession::new(&self.local_ip);
-        sdp.add_audio_media_directed(rtp_port, "sendrecv");
+        sdp.add_audio_media_offer(rtp_port, &self.audio_offer.clone().with_direction("sendrecv"));
         let sdp_body = sdp.to_string();
 
         let reinvite = RequestBuilder::new(SipMethod::Invite, dialog.remote_target.as_deref().unwrap_or(&dialog.remote_uri))
@@ -1335,18 +1949,22 @@ impl SoftPhone {
             .map_err(|e| PhoneError::CallFailed(format!("Error waiting for call: {}", e)))?;
 
         let (invite_msg, source) = incoming;
+        self.log_sip(false, &invite_msg);
 
         // Create dialog from incoming INVITE
         let dialog = SipDialog::from_invite(&invite_msg)
             .ok_or_else(|| PhoneError::CallFailed("Failed to create dialog from INVITE".into()))?;
 
-        // Send 180 Ringing
-        if let SipMessage::Request(ref req) = invite_msg {
-            let ringing = ResponseBuilder::from_request(req, StatusCode::RINGING)
-                .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
-                .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
-                .build();
-            self.transport.send_to(&ringing, source).await?;
+        // Send 180 Ringing unless we are going to send 183 with SDP instead.
+        if !self.early_media {
+            if let SipMessage::Request(ref req) = invite_msg {
+                let ringing = ResponseBuilder::from_request(req, StatusCode::RINGING)
+                    .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                    .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                    .build();
+                self.log_sip(true, &ringing);
+                self.transport.send_to(&ringing, source).await?;
+            }
         }
 
         // Parse SDP from INVITE to get remote RTP address
@@ -1356,36 +1974,123 @@ impl SoftPhone {
                 remote_rtp_addr = Some(addr);
                 self.remote_dtmf_payload_type = dtmf_pt;
             }
+            // Keep CLI --codec / --octet-align. answer_from_remote would
+            // prefer AMR-WB and copy the offer OA, which breaks PCMU UAS
+            // and IQ "omit OA" answers.
         }
 
-        // Create RTP session
+        // Create RTP session. Early media may speak a different codec than the 200 OK.
+        let start_codec = if self.early_media {
+            self.early_codec.unwrap_or(self.rtp_codec)
+        } else {
+            self.rtp_codec
+        };
+        let final_codec = self.rtp_codec;
+        self.rtp_codec = start_codec;
         let rtp_remote = remote_rtp_addr.unwrap_or_else(|| SocketAddr::new(source.ip(), 0));
-        let rtp_config = SessionConfig::new("0.0.0.0:0", rtp_remote, CodecType::Pcmu);
+        let rtp_config = self.session_config("0.0.0.0:0", rtp_remote);
+        self.rtp_codec = final_codec;
         let rtp_session = RtpSession::new(rtp_config).await?;
         let rtp_port = rtp_session.local_addr().port();
 
         // Build SDP answer
         let mut sdp = SdpSession::new(&self.local_ip);
-        sdp.add_audio_media(rtp_port);
+        sdp.add_audio_media_offer(rtp_port, &self.audio_offer);
         let sdp_body = sdp.to_string();
 
-        // Send 200 OK with SDP answer
-        if let SipMessage::Request(ref req) = invite_msg {
-            let ok = ResponseBuilder::from_request(req, StatusCode::OK)
-                .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
-                .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
-                .header(HeaderName::ContentType, "application/sdp")
-                .header(HeaderName::UserAgent, "siphone/0.1.0")
-                .body(&sdp_body)
-                .build();
-            self.transport.send_to(&ok, source).await?;
+        if self.early_media {
+            let early_offer = if let Some(codec) = self.early_codec {
+                match codec {
+                    CodecType::Pcmu => AudioOffer::pcmu_only(),
+                    CodecType::Pcma => AudioOffer::from_names(&["pcma"], self.octet_align),
+                    CodecType::AmrWb => AudioOffer::amrwb_only(self.octet_align),
+                    CodecType::Opus => AudioOffer::from_names(&["opus"], self.octet_align),
+                }
+            } else {
+                self.audio_offer.clone()
+            };
+            let mut early_sdp = SdpSession::new(&self.local_ip);
+            early_sdp.add_audio_media_offer(rtp_port, &early_offer);
+            let early_body = early_sdp.to_string();
+            if let SipMessage::Request(ref req) = invite_msg {
+                let progress = ResponseBuilder::from_request(req, StatusCode::SESSION_PROGRESS)
+                    .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                    .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                    .header(HeaderName::ContentType, "application/sdp")
+                    .header(HeaderName::UserAgent, "siphone/0.1.0")
+                    .body(&early_body)
+                    .build();
+                self.log_sip(true, &progress);
+                self.transport.send_to(&progress, source).await?;
+            }
+        }
+
+        self.answer_sdp_body = Some(sdp_body.clone());
+        self.pending_invite = Some(invite_msg.clone());
+
+        let delay_answer = self.early_media && self.early_delay_ms > 0;
+        if !delay_answer {
+            if let SipMessage::Request(ref req) = invite_msg {
+                let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+                    .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                    .header(HeaderName::To, format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag))
+                    .header(HeaderName::ContentType, "application/sdp")
+                    .header(HeaderName::UserAgent, "siphone/0.1.0")
+                    .body(&sdp_body)
+                    .build();
+                self.log_sip(true, &ok);
+                self.transport.send_to(&ok, source).await?;
+            }
         }
 
         self.dialog = Some(dialog);
         self.rtp_session = Some(rtp_session);
         self.remote_sip_addr = Some(source);
         self.on_hold = false;
+        if !delay_answer {
+            if let Some(ref mut rtp) = self.rtp_session {
+                rtp.set_codec(self.rtp_codec);
+            }
+        }
 
+        Ok(())
+    }
+
+    async fn send_pending_200(&mut self) -> Result<(), PhoneError> {
+        let Some(invite_msg) = self.pending_invite.take() else {
+            return Ok(());
+        };
+        let Some(sdp_body) = self.answer_sdp_body.clone() else {
+            return Ok(());
+        };
+        let Some(dialog) = self.dialog.as_ref() else {
+            return Ok(());
+        };
+        let Some(source) = self.remote_sip_addr else {
+            return Ok(());
+        };
+        let local_addr = self.transport.local_addr();
+        if let SipMessage::Request(ref req) = invite_msg {
+            let ok = ResponseBuilder::from_request(req, StatusCode::OK)
+                .header(HeaderName::Contact, format!("<sip:siphone@{}>", local_addr))
+                .header(
+                    HeaderName::To,
+                    format!("<{}>;tag={}", dialog.local_uri, dialog.local_tag),
+                )
+                .header(HeaderName::ContentType, "application/sdp")
+                .header(HeaderName::UserAgent, "siphone/0.1.0")
+                .body(&sdp_body)
+                .build();
+            self.log_sip(true, &ok);
+            self.transport.send_to(&ok, source).await?;
+        }
+        if let Some(ref mut rtp) = self.rtp_session {
+            rtp.set_codec(self.rtp_codec);
+        }
+        crate::ui::status(&format!(
+            "Sent delayed 200 OK; codec={}",
+            self.rtp_codec
+        ));
         Ok(())
     }
 
@@ -1417,6 +2122,35 @@ impl SoftPhone {
     }
 }
 
+fn write_sip_log(path: Option<&PathBuf>, sent: bool, msg: &SipMessage) {
+    let Some(path) = path else {
+        return;
+    };
+    let raw = msg.to_string();
+    let dir = if sent { "sent" } else { "received" };
+    let block = format!(
+        "--------------------------------------------\nUDP message {} ({} bytes):\n\n{}\n",
+        dir,
+        raw.len(),
+        raw
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(block.as_bytes());
+    }
+}
+
+fn rtp_octet_align(oa: OctetAlign) -> rtp_core::OctetAlign {
+    match oa {
+        OctetAlign::One => rtp_core::OctetAlign::One,
+        OctetAlign::Zero => rtp_core::OctetAlign::Zero,
+        OctetAlign::Omitted => rtp_core::OctetAlign::Omitted,
+    }
+}
+
 /// Parse SDP from a SIP message body and return the remote RTP address + DTMF PT.
 fn parse_sdp_rtp_addr(body: &str) -> Option<(SocketAddr, Option<u8>)> {
     let sdp = SdpSession::parse(body).ok()?;
@@ -1425,6 +2159,16 @@ fn parse_sdp_rtp_addr(body: &str) -> Option<(SocketAddr, Option<u8>)> {
     let dtmf_pt = sdp.get_audio_dtmf_payload_type();
     let addr: SocketAddr = format!("{}:{}", rtp_host, rtp_port).parse().ok()?;
     Some((addr, dtmf_pt))
+}
+
+fn sdp_primary_codec(body: &str) -> Option<CodecType> {
+    let sdp = SdpSession::parse(body).ok()?;
+    for name in sdp.audio_codec_names() {
+        if let Some(codec) = CodecType::from_sdp_name(&name) {
+            return Some(codec);
+        }
+    }
+    None
 }
 
 /// Extract the host part from a SIP URI: sip:user@host[:port] -> host[:port]
@@ -1714,6 +2458,21 @@ fn find_reverse_history_match(
         }
     }
     None
+}
+
+fn start_headless_command_reader() -> (tokio::sync::mpsc::Receiver<String>, std::sync::mpsc::Sender<()>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _keep_open = tx;
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+    (rx, stop_tx)
 }
 
 fn start_interactive_command_reader(max_history: usize) -> (tokio::sync::mpsc::Receiver<String>, std::sync::mpsc::Sender<()>) {
@@ -2165,6 +2924,155 @@ mod tests {
         } else {
             panic!("Expected INVITE request");
         }
+    }
+
+    #[tokio::test]
+    async fn test_softphone_call_amrwb_octet_align() {
+        for oa in [OctetAlign::One, OctetAlign::Zero, OctetAlign::Omitted] {
+            let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+            phone.set_octet_align(oa);
+            phone.set_audio_offer(AudioOffer::amrwb_then_g711(oa));
+
+            let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+
+            phone
+                .call(
+                    "sip:bob@example.com",
+                    Some(&server_addr.to_string()),
+                    Some("alice"),
+                    None,
+                    CodecType::AmrWb,
+                )
+                .await
+                .unwrap();
+
+            let mut buf = vec![0u8; 65535];
+            let (len, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                server_socket.recv_from(&mut buf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+            let body = msg.body().expect("INVITE SDP");
+            let sdp = SdpSession::parse(body).unwrap();
+            assert_eq!(sdp.audio_codec_names()[0], "AMR-WB");
+            assert_eq!(sdp.amr_wb_octet_align(), Some(oa));
+            match oa {
+                OctetAlign::One => assert!(body.contains("octet-align=1")),
+                OctetAlign::Zero => assert!(body.contains("octet-align=0")),
+                OctetAlign::Omitted => assert!(!body.contains("octet-align=")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_softphone_call_amrwb_mode_set_and_sip_log() {
+        let mut phone = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        phone.set_octet_align(OctetAlign::One);
+        phone.set_audio_offer(
+            AudioOffer::amrwb_then_g711(OctetAlign::One).with_amrwb_mode_set("0,1,2"),
+        );
+        let log_path = std::env::temp_dir().join(format!(
+            "sipr-mode-set-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&log_path);
+        phone.set_sip_log_path(Some(log_path.clone()));
+
+        let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        phone
+            .call(
+                "sip:bob@example.com",
+                Some(&server_addr.to_string()),
+                Some("alice"),
+                None,
+                CodecType::AmrWb,
+            )
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_socket.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+        let body = msg.body().expect("INVITE SDP");
+        assert!(body.contains("mode-set=0,1,2"), "{body}");
+        let dumped = std::fs::read_to_string(&log_path).expect("sip log");
+        assert!(dumped.contains("UDP message sent"));
+        assert!(dumped.contains("INVITE "));
+        let _ = std::fs::remove_file(&log_path);
+    }
+
+    #[tokio::test]
+    async fn test_softphone_accept_early_media_183() {
+        let mut uas = SoftPhone::new("127.0.0.1:0").await.unwrap();
+        uas.set_early_media(true);
+        uas.set_audio_offer(AudioOffer::amrwb_then_g711(OctetAlign::One));
+        let uas_addr = uas.local_addr();
+
+        let uac = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let uac_addr = uac.local_addr().unwrap();
+        let mut offer = SdpSession::new("127.0.0.1");
+        offer.add_audio_media_offer(4000, &AudioOffer::amrwb_then_g711(OctetAlign::One));
+        let invite = RequestBuilder::new(SipMethod::Invite, &format!("sip:bob@{}", uas_addr))
+            .header(HeaderName::Via, format!("SIP/2.0/UDP {};branch=z9hG4bKearly", uac_addr))
+            .header(HeaderName::From, "<sip:alice@example.com>;tag=early1")
+            .header(HeaderName::To, format!("<sip:bob@{}>", uas_addr))
+            .header(HeaderName::CallId, "early-media-test")
+            .header(HeaderName::CSeq, "1 INVITE")
+            .header(HeaderName::Contact, format!("<sip:alice@{}>", uac_addr))
+            .header(HeaderName::ContentType, "application/sdp")
+            .body(&offer.to_string())
+            .build();
+
+        let uac_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            uac.send_to(invite.to_string().as_bytes(), uas_addr)
+                .await
+                .unwrap();
+            let mut saw_183 = false;
+            let mut saw_200 = false;
+            let mut buf = vec![0u8; 65535];
+            for _ in 0..6 {
+                let (len, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    uac.recv_from(&mut buf),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let msg = SipMessage::parse(&String::from_utf8_lossy(&buf[..len])).unwrap();
+                if let Some(status) = msg.status() {
+                    if *status == StatusCode::SESSION_PROGRESS {
+                        saw_183 = true;
+                        let sdp = msg.body().unwrap_or("");
+                        assert!(sdp.contains("AMR-WB"), "{sdp}");
+                    }
+                    if *status == StatusCode::OK {
+                        saw_200 = true;
+                    }
+                }
+                if saw_183 && saw_200 {
+                    break;
+                }
+            }
+            (saw_183, saw_200)
+        });
+
+        uas.accept_call(5).await.unwrap();
+        let (saw_183, saw_200) = uac_task.await.unwrap();
+        assert!(saw_183, "UAS should send 183 Session Progress with SDP");
+        assert!(saw_200, "UAS should send 200 OK");
     }
 
     #[tokio::test]
